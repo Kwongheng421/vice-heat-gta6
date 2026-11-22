@@ -1,18 +1,73 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Block Dodger</title>
+<title>Vice Heat — 开放世界罪恶都市</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #11141b; }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  /* Read aloud, never shown: the status line screen readers announce. */
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+html,body{margin:0;height:100%;overflow:hidden;background:#0b1220;font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;color:#eef}
+#game{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#hud{position:fixed;top:10px;left:10px;z-index:5;pointer-events:none;text-shadow:0 1px 3px #000}
+#hud .bar{height:14px;background:#222;border:1px solid #555;border-radius:7px;overflow:hidden;width:200px;margin:2px 0}
+#hud .fill{height:100%;background:#3ddc5a}
+#hud .fill.arm{background:#4db2ff}
+#hud .row{font-size:15px;font-weight:700}
+#stars{font-size:22px;color:#ffd23d;letter-spacing:2px}
+#objective{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:5;background:rgba(0,0,0,.65);padding:8px 14px;border-radius:8px;font-size:15px;max-width:46vw;text-align:center}
+#district{position:fixed;left:12px;bottom:12px;z-index:5;font-size:15px;background:rgba(0,0,0,.55);padding:6px 10px;border-radius:6px}
+#hint{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);z-index:5;background:rgba(0,0,0,.7);padding:8px 14px;border-radius:8px;font-size:15px}
+#minimap{position:fixed;top:10px;right:10px;z-index:5;border:2px solid #888;border-radius:6px;background:#122}
+#speedo{position:fixed;right:12px;bottom:12px;z-index:5;font-size:20px;font-weight:800;text-shadow:0 1px 3px #000}
+.overlay{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;background:rgba(5,10,25,.82)}
+.panel{background:#101a30;border:1px solid #3a5a8a;border-radius:12px;padding:22px 26px;max-width:720px;max-height:92vh;overflow:auto}
+.panel h1{margin:0 0 6px;color:#ffcf3d;font-size:34px}
+.panel h2{margin:14px 0 6px;color:#7fd0ff;font-size:18px}
+.panel p,.panel li{font-size:14px;line-height:1.55}
+button{background:#ffcf3d;border:0;border-radius:8px;padding:10px 18px;font-size:16px;font-weight:800;cursor:pointer;margin:6px 6px 0 0;color:#222}
+button.ghost{background:#26324a;color:#eef}
+#banner{position:fixed;top:38%;left:50%;transform:translate(-50%,-50%);z-index:9;font-size:44px;font-weight:900;color:#ffcf3d;text-shadow:0 3px 12px #000;display:none}
+#dialog{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);z-index:8;background:rgba(10,16,32,.92);border:1px solid #557;padding:14px 18px;border-radius:10px;max-width:620px;display:none;font-size:15px;line-height:1.6}
+#touch{position:fixed;left:0;right:0;bottom:0;z-index:6;display:none;justify-content:space-between;padding:12px;pointer-events:none}
+#touch button{pointer-events:auto;width:64px;height:64px;border-radius:50%;font-size:13px;padding:0;margin:0 4px}
+#vignette{position:fixed;inset:0;pointer-events:none;z-index:4;box-shadow:inset 0 0 120px rgba(255,0,0,0);transition:box-shadow .2s}
+#status{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+.sys{display:grid;grid-template-columns:1fr 1fr;gap:2px 14px;font-size:13px}
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Block Dodger: move the paddle left and right to dodge falling blocks and catch coins"></canvas>
+<canvas id="game" aria-label="Vice Heat 开放世界罪恶都市"></canvas>
+<div id="vignette"></div>
+<div id="hud" style="display:none">
+  <div class="row">❤ <span id="hp">100</span> / 100 &nbsp; 🛡 <span id="armour">0</span></div>
+  <div class="bar"><div class="fill" id="hpfill" style="width:100%"></div></div>
+  <div class="bar"><div class="fill arm" id="armfill" style="width:0%"></div></div>
+  <div class="row">💰 $<span id="money">200</span> &nbsp; ⭐声望 <span id="rep">0</span> &nbsp; 🕐 <span id="clock">08:00</span></div>
+  <div class="row">🔫 <span id="weapon">拳头</span> <span id="ammo"></span> &nbsp; 📦 <span id="pkgs">0/20</span> &nbsp; ✅ <span id="comp">0%</span></div>
+  <div id="stars"></div>
+</div>
+<div id="objective" style="display:none"></div>
+<canvas id="minimap" width="190" height="150"></canvas>
+<div id="district"></div>
+<div id="speedo"></div>
+<div id="hint" style="display:none"></div>
+<div id="banner"></div>
+<div id="dialog"></div>
+<div id="touch"><div><button id="tFire">开火</button><button id="tEnter">上车/E</button></div><div><button id="tSprint">冲刺</button><button id="tAim">瞄准</button></div></div>
+<div class="overlay" id="startScreen"><div class="panel">
+  <h1>🔥 Vice Heat · 开放世界罪恶都市</h1>
+  <p>原创开放世界犯罪游戏（与任何真实游戏系列无关）。徒步与开车探索一座不规则的海滨城市：偷车、通缉、警察追捕、枪战、六章主线剧情、隐藏包裹与经济系统。离线可玩，无需联网。</p>
+  <h2>故事</h2><p>你刚回到罪恶都市，龙叔在酒吧等你。从一把手枪开始，偷车、火并、运货、劫运钞车、抢银行——一步步成为这座城市的传奇。</p>
+  <h2>六章主线（去龙叔酒吧按 E 接任务）</h2>
+  <ol><li>第一章：去东边枪店取手枪，回来见龙叔。</li><li>第二章：偷一辆粉色跑车，开回酒吧。</li><li>第三章：夜市街头火并，打倒 7 名鲨鱼帮成员。</li><li>第四章：150 秒内开黄色送货货车送完 4 个点。</li><li>第五章：截停运钞车，捡走绿色钱袋，甩掉警察。</li><li>第六章：在银行金库门口坚守 45 秒，甩掉警察，撤到南边码头。</li></ol>
+  <h2>系统完整度</h2><div class="sys"><span>✔ 开放世界 / 开车</span><span>✔ 交通与行人</span><span>✔ 通缉与警察</span><span>✔ 主线剧情</span><span>✔ 战斗 / 枪店</span><span>✔ 收集与经济</span><span>✔ HUD 与小地图</span><span>✔ 存档与导出</span></div>
+  <h2>操作（默认展开）</h2><p><b>WASD / 方向键</b> 移动 / 开车 · <b>鼠标</b> 瞄准 · <b>左键</b> 开火 · <b>E</b> 上车 / 偷车 / 对话 / 买东西 / 接任务 · <b>Shift</b> 冲刺 · <b>空格</b> 手刹 · <b>1/2/3/4</b> 切换武器（拳头/手枪/冲锋枪/霰弹枪） · <b>H</b> 喇叭 · <b>M</b> 电台 · <b>Esc / P</b> 暂停。车里不能开枪，下车才能开火。偷别人的车会涨通缉，酒吧旁边的青色“你的车”不算偷。</p>
+  <button id="btnNew">▶ 新游戏</button><button id="btnContinue" class="ghost">继续存档</button><button id="btnHow" class="ghost">操作说明</button>
+  <div id="howBox" style="display:none"><p>靠近车辆按 E 上车；靠近酒吧、枪店、医院、车店按 E 对话/购买；粉色标记和天上的光柱就是当前目标；右上角小地图有商店、目标、警车标记；躲开警察视线约 7 秒消一星，去车店喷漆可清星。</p></div>
+  <p style="color:#9ab">存档：本页会话内 3 个槽位（暂停菜单），也可导出/导入存档文件跨会话继续。本游戏不使用 localStorage。</p>
+</div></div>
+<div class="overlay" id="pauseScreen" style="display:none"><div class="panel"><h1>已暂停</h1><p id="pauseStats"></p>
+<button id="btnResume">继续</button><button id="btnSave1" class="ghost">存档槽 1</button><button id="btnSave2" class="ghost">存档槽 2</button><button id="btnSave3" class="ghost">存档槽 3</button><button id="btnExport" class="ghost">导出存档</button><button id="btnImport" class="ghost">导入存档</button><input type="file" id="importFile" accept="application/json" style="display:none"><button id="btnQuit" class="ghost">回主菜单</button></div></div>
+<div class="overlay" id="endScreen" style="display:none"><div class="panel"><h1 id="endTitle">被捕了</h1><p id="endText"></p><p id="endStats"></p><button id="btnRetry">重新开始本章</button><button id="btnEndMenu" class="ghost">回主菜单</button></div></div>
 <p id="status" role="status" aria-live="polite"></p>
 <script type="module" src="./src/main.js"></script>
 </body>
