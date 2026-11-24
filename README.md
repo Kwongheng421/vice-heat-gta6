@@ -1,52 +1,30 @@
-[![make.fun](https://make.fun/badge.svg)](https://make.fun/bounty/gta6-01)
+[![make.fun](https://make.fun/badge.svg)](https://make.fun)
 
 # Vice Heat — 开放世界罪恶都市
 
-An original open-world crime game built for the [Make GTA 6](https://make.fun/bounty/gta6-01) bounty on make.fun. Top-down 2D, playable offline in a desktop browser — no network requests, no Rockstar / GTA names, characters, maps, art or music. Everything is original.
+原创 top-down 2D 开放世界犯罪游戏：非网格城市、开车抢车、1–5 星通缉、6 章主线剧情、商店经济、20 个隐藏包裹，全部离线可玩。
 
-## Play offline
+## 玩法
+
+你在罪恶都市从跑腿小弟做起，帮龙叔完成 6 章任务：取枪、偷粉色跑车、街头火拼、150 秒限时送货、运钞车劫案、银行金库坚守 45 秒，最后撤到南码头。通关后自由漫游，收集隐藏包裹。
+
+## 操作
+
+- WASD / 方向键：走路 / 开车
+- 鼠标瞄准，左键开火
+- E：上车 / 下车 / 抢车 / 对话 / 买东西 / 接任务
+- Shift：疾跑 · 空格：手刹 · 1/2/3/4：切换武器（拳头 / 手枪 / 冲锋枪 / 霰弹枪）
+- Esc / P：暂停 · H：喇叭 · M：电台（合成音乐）
+
+## 离线游玩
 
 ```sh
 node serve.ts
-# open http://localhost:8080
+# 打开 http://localhost:8080
 ```
 
-Or open `game/index.html` directly in desktop Chrome (ES modules load from local files when served; use the command above for the reliable path).
+或直接用桌面 Chrome 打开 `game/index.html`。无需联网，无外部资源。
 
-## The game
+## 存档
 
-Explore a varied, non-grid seaside city — a diagonal avenue, a curved coastal ring road, a central park with a lake, a night-market square, a port/industrial area, a residential district, glass high-rises downtown, a beach and a wooden pier. Walk and drive, steal cars, dodge the police, fight, shop and collect.
-
-- **World:** ~30 offset intersections, ~60 road segments, traffic that drives the road network, wandering pedestrians, 20 hidden packages.
-- **Wanted 1–5★:** stealing cars, shooting, hitting pedestrians and attacking police raise your wanted level. Police cars chase, 4★ brings roadblocks, 5★ brings a helicopter searchlight. Break line of sight for ~7s to lose a star; a car-shop respray clears all stars. Caught on foot ≈ busted; HP zero ≈ wasted.
-- **Story — 6 chapters** (take each one at 龙叔酒吧, the pink dot, with E): get a pistol at the east gun shop; steal a pink sports car; a street fight with 7 gang members at the night market; a 150-second truck delivery to 4 points in the marked yellow quest truck; stop an armoured truck, grab the green money bag and lose the police; hold the bank vault for 45 seconds, lose the police and exfiltrate to the south dock. Ending screen, then free roam.
-- **Combat & shops:** fists / pistol / SMG / shotgun, hit markers, enemy health bars, screen shake; gun shop, hospital (heal) and car shop (respray/repair).
-- **HUD & saves:** health/armour/money/reputation/clock, minimap with shops/objectives/police and a north marker, weapon/ammo, speedometer while driving, district names, completion % and run stats. 3 in-memory save slots per page session, plus export/import of a save file (no localStorage).
-
-## Controls
-
-| Key | Action |
-|---|---|
-| WASD / arrows | Move / drive |
-| Mouse | Aim |
-| Left click | Fire |
-| E | Enter car / carjack / talk / buy / accept mission |
-| Shift | Sprint |
-| Space | Handbrake |
-| 1 / 2 / 3 / 4 | Switch weapon (fist / pistol / SMG / shotgun) |
-| H | Horn |
-| M | Radio (synthesised) |
-| Esc / P | Pause |
-
-You cannot shoot from inside a car. The cyan car by the bar is yours — driving it does not count as stealing.
-
-## Files
-
-- `game/index.html` + `game/src/world.js` (city) + `game/src/main.js` (game)
-- `main.ts` — entry program, copies `game/` + `screenshots/` to `/output` and writes `dossier.json`
-- `screenshots/` — real renders from running the game
-- `serve.ts` — tiny local static server for development
-
-## License
-
-MIT — see `LICENSE`.
+主菜单支持 3 个存档位（当前页面会话内保存），另可导出 / 导入存档 JSON 文件。不使用 localStorage。

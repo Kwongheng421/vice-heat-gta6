@@ -1,725 +1,727 @@
-// Vice Heat — open-world crime game, written fresh in the recorded session.
-// Top-down 2D canvas game. All systems in this file: movement/driving,
-// traffic + pedestrians, wanted/police, 6-chapter story, combat, shops,
-// collectibles, HUD + minimap, in-memory saves + export/import (no localStorage).
-import { buildCity, WORLD_W, WORLD_H, SEA_Y, BEACH_Y } from './world.js';
+// Vice Heat — open-world crime game, written fresh in this session for gta6-01.
+// Top-down 2D canvas, fully offline, no network calls, all art drawn in code
+// and all sound synthesised with WebAudio. Nothing here copies Rockstar/GTA.
+'use strict';
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const el = id => document.getElementById(id);
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const hyp = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
+const wrapAngle = (a, b) => { let d = a - b; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+function seededRandom(seed) { let t = seed >>> 0; return () => { t += 0x6D2B79F5; let r = Math.imul(t ^ t >>> 15, 1 | t); r ^= r + Math.imul(r ^ r >>> 7, 61 | r); return ((r ^ r >>> 14) >>> 0) / 4294967296; }; }
+const rnd = seededRandom(20261124);
+const between = (a, b) => a + rnd() * (b - a);
+const betweenInt = (a, b) => Math.floor(between(a, b + 1));
+const choice = arr => arr[Math.floor(rnd() * arr.length)];
 
-const params = new URLSearchParams(location.search);
-const shot = params.get('shot');
-const seed = (parseInt(params.get('seed') || '', 10) || 20261122) >>> 0;
-const city = buildCity(seed);
-const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
-const mm = document.getElementById('minimap');
-const mmc = mm.getContext('2d');
-const $ = id => document.getElementById(id);
-function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
-addEventListener('resize', resize); resize();
-
-let AC = null, muted = false;
-function beep(freq, dur, type, vol) {
-  if (muted) return;
-  try {
-    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
-    if (AC.state === 'suspended') AC.resume();
-    const o = AC.createOscillator(), g = AC.createGain();
-    o.type = type || 'square'; o.frequency.value = freq;
-    g.gain.setValueAtTime(vol || 0.06, AC.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
-    o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + dur);
-  } catch (e) { /* audio is optional */ }
-}
-const sShoot = () => beep(220 + Math.random() * 120, 0.08, 'square', 0.05);
-const sHit = () => beep(140, 0.12, 'sawtooth', 0.07);
-const sPick = () => { beep(660, 0.1, 'sine', 0.07); setTimeout(() => beep(880, 0.12, 'sine', 0.07), 90); };
-const sHorn = () => beep(330, 0.25, 'square', 0.08);
-let radioOn = false, radioTimer = null;
-function toggleRadio() {
-  radioOn = !radioOn;
-  if (radioOn) { let n = 0; radioTimer = setInterval(() => { if (!radioOn) return; beep([262, 330, 392, 523][n++ % 4], 0.18, 'triangle', 0.04); }, 220); }
-  else if (radioTimer) clearInterval(radioTimer);
-}
-
-const WEAPONS = [
-  { name: '拳头', dmg: 12, rate: 0.32, range: 46, auto: false, ammo: Infinity },
-  { name: '手枪', dmg: 22, rate: 0.28, range: 380, auto: false, ammo: 0 },
-  { name: '冲锋枪', dmg: 13, rate: 0.09, range: 320, auto: true, ammo: 0 },
-  { name: '霰弹枪', dmg: 11, rate: 0.75, range: 240, auto: false, ammo: 0 },
+// ---------------- City: a NON-GRID town ----------------
+const MAP_W = 3200, MAP_H = 2400;
+// 54 jittered intersections: six uneven rows plus a diagonal avenue and a
+// curved coastal ring along the south shore. No 8x8 grid anywhere.
+const POINTS = [
+  [300,250],[700,220],[1100,260],[1500,230],[1900,270],[2300,240],[2700,260],[3000,250],
+  [250,600],[650,580],[1050,620],[1450,590],[1850,610],[2250,580],[2650,620],[2950,600],
+  [300,950],[700,930],[1100,970],[1500,940],[1900,960],[2300,930],[2700,970],[3000,950],
+  [250,1300],[650,1280],[1050,1320],[1450,1290],[1850,1310],[2250,1280],[2650,1320],[2950,1300],
+  [300,1650],[700,1630],[1100,1670],[1500,1640],[1900,1660],[2300,1630],[2700,1670],[3000,1650],
+  [350,1950],[750,1930],[1150,1970],[1550,1940],[1950,1960],[2350,1930],[2750,1970],[2950,1950],
+  [420,380],[820,730],[1180,1010],[1620,1380],[2080,1690],[2580,1920],
 ];
-const CHAPTERS = [
-  '第一章：去东边枪店取手枪',
-  '第二章：偷一辆粉色跑车',
-  '第三章：夜市火并鲨鱼帮',
-  '第四章：150秒送货四站',
-  '第五章：劫运钞车夺钱袋',
-  '第六章：银行金库坚守45秒',
-];
-const G = {
-  screen: 'title', chapter: 1, step: 0, missionActive: false, missionText: '去龙叔酒吧按 E 接任务',
-  target: null, time: 8 * 3600, clock: 0, money: 200, rep: 0,
-  hp: 100, armour: 0, wanted: 0, maxWanted: 0, starsTimer: 0, bustedTimer: 0,
-  shots: 0, hits: 0, stolen: 0, driveDist: 0, pkgsGot: 0, kills: 0,
-  deliveryIdx: 0, deliveryTimer: 0, vaultTimer: 0, gangLeft: 0, moneyBag: null,
-  shake: 0, vignette: 0, bannerTimer: 0, ended: false, freeRoam: false,
-  camX: 0, camY: 0, zoom: 1,
-};
-const P = { x: city.bar.x, y: city.bar.y, ang: -Math.PI / 2, vx: 0, vy: 0, speed: 0, car: null, weapon: 0, owned: [true, false, false, false], ammo: [Infinity, 0, 0, 0], fireCd: 0, sprint: false };
-const saves = [null, null, null];
-const CAR_COLORS = ['#e74c3c', '#f2b134', '#4db2ff', '#9b59b6', '#e67e22', '#2ecc71', '#ecf0f1', '#34495e'];
-let cars = [], peds = [], enemies = [], police = [], bullets = [], effects = [], heli = null;
-let armoured = null, questTruck = null, pinkCar = null;
-
-function rand(a, b) { return a + Math.random() * (b - a); }
-function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
-function nearCar() {
-  let best = null, bd = 88;
-  for (const c of cars) { const d = Math.hypot(c.x - P.x, c.y - P.y); if (d < bd) { bd = d; best = c; } }
+const pt = i => ({ x: POINTS[i][0], y: POINTS[i][1] });
+const ROADS = [];
+const link = (a, b) => ROADS.push([a, b]);
+for (let r = 0; r < 6; r++) for (let c = 0; c < 7; c++) link(r * 8 + c, r * 8 + c + 1);
+for (let c = 0; c < 8; c++) for (let r = 0; r < 5; r++) link(r * 8 + c, (r + 1) * 8 + c);
+// Diagonal avenue: each diagonal node only joins its neighbours and ONE
+// nearby grid node, so no long diagonal ever slashes across blocks.
+link(48, 49); link(49, 50); link(50, 51); link(51, 52); link(52, 53);
+link(0, 48); link(48, 9); link(49, 17); link(50, 26); link(51, 34); link(52, 44); link(53, 45);
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+  let t = L ? ((px - ax) * dx + (py - ay) * dy) / L : 0; t = clamp(t, 0, 1);
+  return hyp(px, py, ax + dx * t, ay + dy * t);
+}
+function closestPoint(x, y) { let bi = 0, bd = 1e9; POINTS.forEach((n, i) => { const d = hyp(x, y, n[0], n[1]); if (d < bd) { bd = d; bi = i; } }); return bi; }
+function findRoute(a, b) {
+  const adj = {}; ROADS.forEach(([u, v]) => { (adj[u] = adj[u] || []).push(v); (adj[v] = adj[v] || []).push(u); });
+  const prev = { [a]: -1 }, q = [a];
+  while (q.length) { const u = q.shift(); if (u === b) break; for (const v of (adj[u] || [])) if (!(v in prev)) { prev[v] = u; q.push(v); } }
+  if (!(b in prev)) return null;
+  const path = []; let c = b; while (c !== -1) { path.unshift(c); c = prev[c]; } return path;
+}
+// Districts and water
+const PARK = { x: 1420, y: 950, w: 560, h: 420 };
+const LAKE = { x: 1700, y: 1160, rx: 170, ry: 110 };
+const MARKET = { x: 2150, y: 1180, w: 340, h: 240 };
+const PORT = { x: 2820, y: 1180, w: 330, h: 300 };
+const BEACH_Y = 2030, SEA_Y = 2150, DOCK = { x: 1550, y: 2060 };
+const inLake = (x, y) => { const dx = (x - LAKE.x) / LAKE.rx, dy = (y - LAKE.y) / LAKE.ry; return dx * dx + dy * dy < 1; };
+const inSea = (x, y) => y > SEA_Y;
+// True rect-to-centreline clearance. A car is radius 20 and weaves ~35px off
+// the centreline when cutting corners, so generation demands >= 75px.
+function rectClearance(x, y, w, h) {
+  const b = { x, y, w, h };
+  const dPt = (px, py) => { const dx = Math.max(b.x - px, 0, px - (b.x + b.w)), dy = Math.max(b.y - py, 0, py - (b.y + b.h)); return Math.hypot(dx, dy); };
+  let best = 1e9;
+  for (const [a, bb] of ROADS) {
+    const A = pt(a), B = pt(bb);
+    if (A.x > b.x && A.x < b.x + b.w && A.y > b.y && A.y < b.y + b.h) return 0;
+    if (B.x > b.x && B.x < b.x + b.w && B.y > b.y && B.y < b.y + b.h) return 0;
+    let d = Math.min(dPt(A.x, A.y), dPt(B.x, B.y));
+    for (const [cx, cy] of [[b.x, b.y], [b.x + b.w, b.y], [b.x, b.y + b.h], [b.x + b.w, b.y + b.h]]) d = Math.min(d, segDist(cx, cy, A.x, A.y, B.x, B.y));
+    best = Math.min(best, d);
+  }
   return best;
 }
-function spawnCars() {
-  cars = [];
-  // starter car: cyan, owned, by the bar — driving it is not stealing.
-  cars.push({ x: city.bar.x + 52, y: city.bar.y + 26, ang: 0, speed: 0, color: '#2fd6d6', kind: 'car', wasPlayersCar: true, isStarter: true, hp: 100, ai: null });
-  questTruck = { x: 0, y: 0, ang: 0, speed: 0, color: '#f2b134', kind: 'truck', isQuestTruck: true, wasPlayersCar: false, hp: 100, ai: null };
-  const qt = city.freeSpot(city.bar.x + 108, city.bar.y - 82); questTruck.x = qt.x; questTruck.y = qt.y;
-  cars.push(questTruck);
-  pinkCar = { x: city.pinkCarSpot.x, y: city.pinkCarSpot.y, ang: 0.4, speed: 0, color: '#ff7ad9', kind: 'sport', isPink: true, wasPlayersCar: false, hp: 100, ai: null };
-  cars.push(pinkCar);
-  // parked cars along roads
-  for (let i = 0; i < 16; i++) {
-    const s = city.segs[Math.floor(Math.random() * city.segs.length)];
-    const a = city.nodes[s.a], b = city.nodes[s.b], t = Math.random();
-    const x = a.x + (b.x - a.x) * t + rand(-14, 14), y = a.y + (b.y - a.y) * t + rand(-14, 14);
-    if (Math.hypot(x - city.bar.x, y - city.bar.y) < 90) continue;
-    cars.push({ x, y, ang: Math.atan2(b.y - a.y, b.x - a.x), speed: 0, color: CAR_COLORS[i % CAR_COLORS.length], kind: 'car', wasPlayersCar: false, hp: 100, ai: null });
-  }
-  // traffic cars driving the network
-  for (let i = 0; i < 12; i++) {
-    const s = city.segs[Math.floor(Math.random() * city.segs.length)];
-    cars.push({ x: city.nodes[s.a].x, y: city.nodes[s.a].y, ang: 0, speed: rand(55, 85), color: CAR_COLORS[(i + 2) % CAR_COLORS.length], kind: 'car', wasPlayersCar: false, hp: 100, ai: { seg: s, from: s.a, to: s.b, t: 0 } });
-  }
-  peds = [];
-  for (let i = 0; i < 24; i++) {
-    const s = city.segs[Math.floor(Math.random() * city.segs.length)];
-    const a = city.nodes[s.a];
-    peds.push({ x: a.x + rand(-30, 30), y: a.y + rand(-30, 30), ang: rand(0, 6.28), speed: rand(18, 34), hp: 30, color: ['#ffd23d', '#ff8fa3', '#7fd0ff', '#b5e48c'][i % 4], wander: rand(2, 6) });
-  }
-  enemies = []; police = []; bullets = []; effects = []; heli = null; armoured = null;
-  G.moneyBag = null;
+// Buildings. Specials first: each sits between road rows AND between road
+// columns, verified >= 75px clear of every centreline (see __VH.roadClearance).
+const HOUSES = [];
+const ROOF_COLOURS = ['#c94f4f', '#4f7ec9', '#4fc98a', '#c9a44f'];
+function putHouse(x, y, w, h, opt = {}) { HOUSES.push({ x, y, w, h, colour: opt.colour || choice(ROOF_COLOURS), roof: opt.roof ?? betweenInt(0, 3), label: opt.label || '', kind: opt.kind || 'house' }); }
+const BAR = { x: 470, y: 760, w: 120, h: 80, label: '龙叔酒吧', kind: 'bar' };
+const GUN = { x: 2460, y: 420, w: 120, h: 80, label: '枪店', kind: 'gun' };
+const CLINIC = { x: 860, y: 360, w: 130, h: 80, label: '医院', kind: 'hospital' };
+const GARAGE = { x: 1680, y: 1740, w: 140, h: 80, label: '修车行', kind: 'carshop' };
+const BANK = { x: 1620, y: 420, w: 130, h: 90, label: '银行', kind: 'bank' };
+[BAR, GUN, CLINIC, GARAGE, BANK].forEach(s => putHouse(s.x, s.y, s.w, s.h, { label: s.label, kind: s.kind, colour: '#8a5fd0' }));
+function hitsHouse(x, y, r) { for (const b of HOUSES) if (x + r > b.x && x - r < b.x + b.w && y + r > b.y && y - r < b.y + b.h) return b; return null; }
+let placed = 0, tries = 0;
+while (HOUSES.length < 110 && tries < 4000) {
+  tries++;
+  const x = between(80, MAP_W - 220), y = between(80, 2000), w = between(70, 140);
+  const cx = x + w / 2, downtown = cx > 1300 && cx < 2300 && y < 900;
+  const h = downtown ? between(110, 150) : between(60, 120);
+  if (rectClearance(x, y, w, h) < 75) continue;
+  if (cx > PARK.x - 40 && cx < PARK.x + PARK.w + 40 && y > PARK.y - 40 && y < PARK.y + PARK.h + 40) continue;
+  if (cx > MARKET.x - 30 && cx < MARKET.x + MARKET.w + 30 && y > MARKET.y - 30 && y < MARKET.y + MARKET.h + 30) continue;
+  if (cx > PORT.x - 20 && cx < PORT.x + PORT.w + 20 && y > PORT.y - 20 && y < PORT.y + PORT.h + 20) continue;
+  if (inLake(cx, y + h / 2) || y > BEACH_Y) continue;
+  if (HOUSES.some(b => cx > b.x - 30 && cx < b.x + b.w + 30 && y + h / 2 > b.y - 30 && y + h / 2 < b.y + b.h + 30)) continue;
+  putHouse(x, y, w, h, { colour: downtown ? '#3a6ea8' : undefined, roof: downtown ? 3 : betweenInt(0, 3) });
+  placed++;
 }
-function resetGame() {
-  Object.assign(G, { screen: 'play', chapter: 1, step: 0, missionActive: false, missionText: '去龙叔酒吧按 E 接任务', target: { x: city.bar.x, y: city.bar.y, label: '龙叔酒吧' }, time: 8 * 3600, money: 200, rep: 0, hp: 100, armour: 0, wanted: 0, maxWanted: 0, starsTimer: 0, bustedTimer: 0, shots: 0, hits: 0, stolen: 0, driveDist: 0, pkgsGot: 0, kills: 0, deliveryIdx: 0, deliveryTimer: 0, vaultTimer: 0, gangLeft: 0, ended: false, freeRoam: false, vignette: 0 });
-  P.x = city.bar.x; P.y = city.bar.y; P.ang = -Math.PI / 2; P.vx = 0; P.vy = 0; P.speed = 0; P.car = null;
-  P.weapon = 0; P.owned = [true, false, false, false]; P.ammo = [Infinity, 0, 0, 0]; P.fireCd = 0;
-  city.packages.forEach(p => p.got = false);
-  spawnCars();
-  showScreen('play');
+// Port warehouses: tucked in the pocket east of the x=2950 road, south of the
+// y=1300 road, so they never block a centreline.
+for (let i = 0; i < 4; i++) putHouse(PORT.x + 240 + (i % 2) * 55, PORT.y + 180 + Math.floor(i / 2) * 60, 50, 50, { colour: '#7a6a55', roof: 1 });
+const CRATES = []; for (let i = 0; i < 10; i++) CRATES.push({ x: PORT.x + between(0, 260), y: PORT.y + 160 + between(0, 110), w: 44, h: 20, colour: choice(['#d06030', '#30a0d0', '#d0b030']) });
+const TREES = [];
+for (let i = 0; i < 90; i++) { const x = between(60, MAP_W - 60), y = between(60, 2120); if (rectClearance(x - 12, y - 12, 24, 24) < 30 || hitsHouse(x, y, 20) || inLake(x, y)) continue; TREES.push({ x, y, palm: y > BEACH_Y || rnd() < 0.3 }); }
+const LOTS = [{ x: 2250, y: 880, w: 180, h: 90 }, { x: 600, y: 1560, w: 180, h: 90 }, { x: 2650, y: 1560, w: 180, h: 90 }];
+const PKG_SPOTS = [[760,1010],[2620,640],[1080,300],[1900,1980],[1900,650],[2300,1250],[2900,1250],[1500,1000],[1850,1160],[350,300],[2950,300],[300,1650],[1100,1670],[1550,2060],[700,1630],[2700,1670],[420,380],[2080,1690],[1050,1320],[650,580]];
+const DELIVERY_POINTS = [[350,1950],[2950,600],[300,250],[2700,1670]];
+
+// ---------------- Synthesised audio (no files) ----------------
+let actx = null, radioOn = false, radioTick = 0;
+function audioCtx() { try { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); return actx; } catch (e) { return null; } }
+function tone(freq, dur = 0.08, type = 'square', vol = 0.05) { const a = audioCtx(); if (!a) return; try { const o = a.createOscillator(), g = a.createGain(); o.type = type; o.frequency.value = freq; g.gain.value = vol; o.connect(g); g.connect(a.destination); o.start(); g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur); o.stop(a.currentTime + dur); } catch (e) {} }
+const sfx = {
+  shoot: () => tone(220, 0.07, 'square', 0.06),
+  hit: () => tone(140, 0.1, 'sawtooth', 0.06),
+  pickup: () => { tone(660, 0.08); setTimeout(() => tone(880, 0.1), 80); },
+  coin: () => tone(990, 0.12, 'sine', 0.06),
+  horn: () => tone(330, 0.25, 'sawtooth', 0.05),
+  busted: () => tone(110, 0.5, 'sawtooth', 0.08),
+};
+
+// ---------------- Game state ----------------
+const GUNS = [
+  { name: '拳头', dmg: 12, rate: 0.35, range: 46, auto: false, ammo: Infinity },
+  { name: '手枪', dmg: 22, rate: 0.32, range: 420, auto: false, ammo: 120 },
+  { name: '冲锋枪', dmg: 11, rate: 0.09, range: 380, auto: true, ammo: 240 },
+  { name: '霰弹枪', dmg: 14, rate: 0.8, range: 300, auto: false, ammo: 40, pellets: 6 },
+];
+function newGame() {
+  return {
+    mode: 'menu', chapter: 1, stage: 0, clock: 8 * 60,
+    hero: { x: 700, y: 1000, angle: -Math.PI / 2, hp: 100, armor: 0, inCar: null, weapon: 0, fireCd: 0 },
+    money: 500, gold: 0, rep: 0, wanted: 0, outOfSight: 0, bustedTimer: 0,
+    owned: [true, false, false, false], ammo: [Infinity, 0, 0, 0],
+    cars: [], walkers: [], cops: [], heli: null, shots: [], foes: [], gangLeft: 0,
+    packs: PKG_SPOTS.map(([x, y]) => ({ x, y, got: false })),
+    stats: { stolen: 0, fired: 0, landed: 0, driven: 0, maxWanted: 0 },
+    vault: 0, vaultTier: 0, shipTimer: 150, shipIdx: 0, bagOut: false, bagTaken: false, bagAt: null,
+    truckHp: 300, truck: null, banner: '', bannerT: 0, shake: 0, flash: 0,
+    objective: '去龙叔酒吧接任务', camX: 700, camY: 1000,
+    pilot: null, testMode: null, testClock: 0, testResult: '',
+  };
 }
-function completion() { return Math.round(((G.chapter - 1) / 6) * 70 + (G.pkgsGot / 20) * 30); }
-function addWanted(n, why) {
-  G.wanted = Math.min(5, G.wanted + n); G.maxWanted = Math.max(G.maxWanted, G.wanted); G.starsTimer = 0;
-  if (G.wanted >= 3) spawnPolice();
+let G = newGame();
+const SLOTS = [null, null, null]; // in-memory only, never localStorage
+function toast(msg) { const t = el('toast'); t.textContent = msg; t.classList.remove('hidden'); clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add('hidden'), 2600); }
+function showDlg(html) { const d = el('dlg'); d.innerHTML = html; d.classList.remove('hidden'); }
+function hideDlg() { el('dlg').classList.add('hidden'); }
+function showShop(html) { const d = el('shop'); d.innerHTML = html; d.classList.remove('hidden'); }
+function hideShop() { el('shop').classList.add('hidden'); }
+function hideMenus() { el('menu').classList.add('hidden'); el('pauseMenu').classList.add('hidden'); el('endMenu').classList.add('hidden'); }
+function showBanner(t) { G.banner = t; G.bannerT = 2.6; tone(520, 0.15); setTimeout(() => tone(780, 0.2), 140); }
+function statsLine() {
+  const acc = G.stats.fired ? Math.round(100 * G.stats.landed / G.stats.fired) : 0;
+  const pkgs = G.packs.filter(p => p.got).length;
+  return `金钱 $${G.money} · 金块 ${G.gold} · 声望 ${G.rep} · 包裹 ${pkgs}/20 · 偷车 ${G.stats.stolen} · 命中率 ${acc}% · 驾驶 ${Math.round(G.stats.driven)}m · 最高通缉 ${G.stats.maxWanted}★`;
 }
-function spawnPolice() {
-  const want = G.wanted >= 4 ? 3 : G.wanted >= 2 ? 2 : 1;
-  while (police.filter(p => p.kind === 'car').length < want) {
-    const s = city.segs[Math.floor(Math.random() * city.segs.length)];
-    police.push({ kind: 'car', x: city.nodes[s.a].x + rand(-40, 40), y: city.nodes[s.a].y + rand(-40, 40), ang: 0, speed: 0, hp: 60, color: '#2233ff', isPolice: true });
-  }
-  if (G.wanted >= 3) while (police.filter(p => p.kind === 'foot').length < 2)
-    police.push({ kind: 'foot', x: P.x + rand(-260, 260), y: P.y + rand(-260, 260), ang: 0, speed: 62, hp: 40, color: '#2233ff', isPolice: true });
-  if (G.wanted >= 5 && !heli) heli = { x: P.x, y: P.y - 200, ang: 0 };
-  if (G.wanted >= 4) spawnRoadblocks();
+function refreshObjective() {
+  const h = G.hero;
+  if (G.chapter === 1) G.objective = G.stage === 0 ? '去龙叔酒吧（粉色点）按 E 接任务' : G.stage === 1 ? '去东边枪店取手枪，再回酒吧' : '回酒吧见龙叔，完成第一章';
+  else if (G.chapter === 2) G.objective = '偷粉色跑车（停车场），开回酒吧';
+  else if (G.chapter === 3) G.objective = '击败鲨鱼帮：剩余 ' + G.gangLeft + ' 人';
+  else if (G.chapter === 4) G.objective = '限时送货：已送 ' + G.shipIdx + '/4，剩余 ' + Math.ceil(G.shipTimer) + ' 秒（须在黄色货车内）';
+  else if (G.chapter === 5) G.objective = G.bagTaken ? '甩掉警察（通缉归零）' : '撞停或打停运钞车，捡绿色钱袋';
+  else if (G.chapter === 6) G.objective = G.vault >= 45 ? '甩掉警察，撤到南码头' : '在银行金库坚守：' + Math.floor(G.vault) + '/45 秒';
+  else G.objective = '自由漫游：收集 20 个隐藏包裹';
 }
-let roadblocks = [];
-function spawnRoadblocks() {
-  roadblocks = [];
-  for (let i = 0; i < 3; i++) {
-    const n = city.nodes[Math.floor(Math.random() * city.nodes.length)];
-    roadblocks.push({ x: n.x, y: n.y });
-  }
+function missionSpot() {
+  if (G.chapter === 1) return G.stage === 1 ? { x: GUN.x + 60, y: GUN.y + 40 } : { x: BAR.x + 60, y: BAR.y + 40 };
+  if (G.chapter === 2) return { x: 2320, y: 920 };
+  if (G.chapter === 3 && G.foes.length) return { x: G.foes[0].x, y: G.foes[0].y };
+  if (G.chapter === 4) return { x: DELIVERY_POINTS[G.shipIdx][0], y: DELIVERY_POINTS[G.shipIdx][1] };
+  if (G.chapter === 5) return G.bagOut && !G.bagTaken ? { x: G.bagAt.x, y: G.bagAt.y } : { x: G.truck.x, y: G.truck.y };
+  if (G.chapter === 6) return G.vault >= 45 ? { x: DOCK.x, y: DOCK.y } : { x: BANK.x + 65, y: BANK.y + 45 };
+  return null;
 }
-// ---- input ----
-const keys = {};
-let mouse = { x: 0, y: 0, down: false };
+function saveSlot(i) { SLOTS[i] = JSON.stringify({ chapter: G.chapter, stage: G.stage, money: G.money, gold: G.gold, rep: G.rep, owned: G.owned, ammo: G.ammo, px: G.hero.x, py: G.hero.y, packs: G.packs.map(p => p.got) }); toast('已保存到存档 ' + (i + 1)); }
+function loadSlot(i) {
+  const raw = SLOTS[i]; if (!raw) { toast('存档 ' + (i + 1) + ' 为空'); return false; }
+  try {
+    const d = JSON.parse(raw); G = newGame();
+    Object.assign(G, { chapter: d.chapter, stage: d.stage, money: d.money, gold: d.gold, rep: d.rep, owned: d.owned, ammo: d.ammo });
+    G.hero.x = d.px; G.hero.y = d.py; d.packs.forEach((g, j) => { if (G.packs[j]) G.packs[j].got = g; });
+    buildWorld(); G.mode = 'play'; hideMenus(); refreshObjective(); return true;
+  } catch (e) { toast('存档损坏'); return false; }
+}
+function exportSave() {
+  const blob = new Blob([JSON.stringify({ chapter: G.chapter, stage: G.stage, money: G.money, gold: G.gold, owned: G.owned, ammo: G.ammo, px: G.hero.x, py: G.hero.y })], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'vice-heat-save.json'; a.click();
+}
+function addWanted(n) { G.wanted = clamp(G.wanted + n, 0, 5); G.stats.maxWanted = Math.max(G.stats.maxWanted, G.wanted); }
+function finishChapter(n) {
+  showBanner('MISSION PASSED · 第 ' + n + ' 章完成');
+  G.money += 300 + n * 100; G.gold += 1; G.rep += 20;
+  G.chapter = n + 1; G.stage = 0; G.gangLeft = 0; G.vault = 0;
+  if (n === 3) G.foes = [];
+  if (n === 6) showEnding('通关！', '你完成了全部 6 章，成为罪恶都市的传奇。之后可以自由漫游，收集剩下的隐藏包裹。');
+  refreshObjective(); hideDlg();
+}
+function showEnding(title, text) { G.mode = 'end'; el('endTitle').textContent = title; el('endText').textContent = text + ' ' + statsLine(); el('endMenu').classList.remove('hidden'); }
+function wasted() { G.mode = 'end'; sfx.busted(); G.money = Math.max(0, G.money - 200); G.wanted = 0; G.hero.hp = 100; G.hero.x = BAR.x + 60; G.hero.y = BAR.y + 120; G.hero.inCar = null; showEnding('WASTED', '你倒下了。医院账单 $200，通缉清零。'); }
+function busted() { G.mode = 'end'; sfx.busted(); G.money = Math.max(0, G.money - 200); G.wanted = 0; G.hero.x = BAR.x + 60; G.hero.y = BAR.y + 120; G.hero.inCar = null; showEnding('BUSTED', '你被警察抓住了。保释金 $200，通缉清零。'); }
+
+// ---------------- Spawning ----------------
+const CAR_PAINT = ['#e74c3c', '#3498db', '#f1c40f', '#9b59b6', '#1abc9c', '#e67e22', '#ecf0f1', '#2ecc71'];
+function makeCar(x, y, colour, opt = {}) {
+  return { x, y, angle: opt.angle ?? between(0, Math.PI * 2), speed: 0, colour, owned: !!opt.owned, quest: !!opt.quest, armoured: !!opt.armoured, pink: !!opt.pink, hp: opt.hp ?? 100, edge: opt.edge ?? betweenInt(0, ROADS.length - 1), t: rnd(), dir: rnd() < 0.5 ? 1 : -1, traffic: !!opt.traffic, dead: false };
+}
+function buildWorld() {
+  G.cars = []; G.walkers = []; G.cops = []; G.heli = null; G.shots = []; G.foes = [];
+  G.cars.push(makeCar(770, 985, '#00d0d0', { owned: true, angle: 0 })); // starter car, on open ground by the bar
+  for (const lot of LOTS) for (let i = 0; i < 3; i++) G.cars.push(makeCar(lot.x + 20 + i * 55, lot.y + 30, '#888888', { angle: 0 }));
+  const pink = G.cars[G.cars.length - 1]; pink.x = 2320; pink.y = 920; pink.colour = '#ff69b4'; pink.pink = true;
+  G.cars.push(makeCar(860, 985, '#ffd400', { quest: true, angle: 0 })); // yellow delivery truck
+  const arm = makeCar(1500, 940, '#5a6a7a', { armoured: true, hp: 300 }); arm.edge = 18; arm.t = 0.2; G.cars.push(arm); G.truck = arm;
+  for (let i = 0; i < 14; i++) G.cars.push(makeCar(0, 0, choice(CAR_PAINT), { traffic: true }));
+  G.cars.filter(c => c.traffic).forEach(c => { const [a, b] = ROADS[c.edge]; const A = pt(a), B = pt(b); c.x = A.x + (B.x - A.x) * c.t; c.y = A.y + (B.y - A.y) * c.t; c.angle = Math.atan2(B.y - A.y, B.x - A.x) + (c.dir < 0 ? Math.PI : 0); });
+  for (let i = 0; i < 20; i++) { let x, y; do { x = between(150, MAP_W - 150); y = between(150, 2000); } while (hitsHouse(x, y, 16) || inLake(x, y) || rectClearance(x - 16, y - 16, 32, 32) < 40); G.walkers.push({ x, y, angle: between(0, 6.28), speed: between(20, 45), hp: 50, tx: x, ty: y, wait: between(0, 2) }); }
+  G.gangLeft = 0; G.shipIdx = 0; G.shipTimer = 150; G.vault = 0; G.vaultTier = 0; G.bagOut = false; G.bagTaken = false; G.truckHp = 300;
+  refreshObjective();
+}
+function nearestCar(x, y, maxD) { let best = null, bd = maxD; for (const c of G.cars) { if (c.dead) continue; const d = hyp(x, y, c.x, c.y); if (d < bd) { bd = d; best = c; } } return best; }
+
+// ---------------- Movement: WALL SLIDING ----------------
+// Axis-separated collision: move X first, then Y. A wall blocks one axis
+// only, so the other axis still moves — cars slide along buildings instead
+// of dead-stopping on impact.
+function slideMove(e, dx, dy, r) {
+  const nx = e.x + dx;
+  if (!hitsHouse(nx, e.y, r) && !inLake(nx, e.y) && !inSea(nx, e.y)) e.x = nx;
+  const ny = e.y + dy;
+  if (!hitsHouse(e.x, ny, r) && !inLake(e.x, ny) && !inSea(e.x, ny)) e.y = ny;
+}
+// ---------------- Input ----------------
+const keys = {}; const mouse = { x: 640, y: 360, down: false };
 addEventListener('keydown', e => {
-  keys[e.code] = true;
-  if (e.code === 'KeyM') toggleRadio();
-  if (e.code === 'KeyH') { sHorn(); addEffect(P.x, P.y, '♪'); }
-  if (e.code === 'Escape' || e.code === 'KeyP') { if (G.screen === 'play') showScreen('pause'); else if (G.screen === 'pause') showScreen('play'); }
-  if (e.code === 'KeyE') doInteract();
-  if (['Digit1', 'Digit2', 'Digit3', 'Digit4'].includes(e.code)) {
-    const w = Number(e.code.slice(-1)) - 1;
-    if (P.owned[w]) { P.weapon = w; }
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === 'Escape' || e.key.toLowerCase() === 'p') {
+    if (G.mode === 'play') { G.mode = 'pause'; el('pauseStats').textContent = statsLine(); el('pauseMenu').classList.remove('hidden'); }
+    else if (G.mode === 'pause') { G.mode = 'play'; el('pauseMenu').classList.add('hidden'); }
   }
-  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+  if (e.key.toLowerCase() === 'e' && G.mode === 'play') interact();
+  if (e.key.toLowerCase() === 'h' && G.mode === 'play') { sfx.horn(); toast('哔——！'); }
+  if (e.key.toLowerCase() === 'm' && G.mode === 'play') { radioOn = !radioOn; toast(radioOn ? '电台：开启（合成音乐）' : '电台：关闭'); }
+  if (['1', '2', '3', '4'].includes(e.key) && G.mode === 'play') { const i = +e.key - 1; if (G.owned[i]) { G.hero.weapon = i; toast('武器：' + GUNS[i].name); } }
 });
-addEventListener('keyup', e => { keys[e.code] = false; });
-canvas.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
-canvas.addEventListener('mousedown', e => { if (e.button === 0) mouse.down = true; });
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); mouse.x = (e.clientX - r.left) * (cv.width / r.width); mouse.y = (e.clientY - r.top) * (cv.height / r.height); });
+cv.addEventListener('mousedown', e => { if (e.button === 0) mouse.down = true; });
 addEventListener('mouseup', () => { mouse.down = false; });
-canvas.addEventListener('contextmenu', e => e.preventDefault());
-if ('ontouchstart' in window) $('touch').style.display = 'flex';
-$('tFire').addEventListener('touchstart', e => { e.preventDefault(); mouse.down = true; }, { passive: false });
-$('tFire').addEventListener('touchend', () => { mouse.down = false; });
-$('tEnter').addEventListener('touchstart', e => { e.preventDefault(); doInteract(); }, { passive: false });
-$('tSprint').addEventListener('touchstart', e => { e.preventDefault(); keys.ShiftLeft = true; }, { passive: false });
-$('tSprint').addEventListener('touchend', () => { keys.ShiftLeft = false; });
-$('tAim').addEventListener('touchstart', e => { e.preventDefault(); mouse.x = innerWidth / 2; mouse.y = 0; }, { passive: false });
+if ('ontouchstart' in window) {
+  el('touch').style.display = 'block';
+  el('tEnter').onclick = () => interact();
+  el('tFire').onclick = () => { mouse.down = true; setTimeout(() => mouse.down = false, 120); };
+  el('tRun').onclick = () => { keys['shift'] = true; setTimeout(() => keys['shift'] = false, 600); };
+}
+// E interaction: a vehicle within 52px beats dialogue (56px radius).
+function interact() {
+  const h = G.hero;
+  if (h.inCar) { const c = h.inCar; h.inCar = null; c.speed = 0; h.x = c.x + 34; h.y = c.y; toast('已下车'); return; }
+  const car = nearestCar(h.x, h.y, 88);
+  if (car && hyp(h.x, h.y, car.x, car.y) <= 52) { boardCar(car); return; }
+  const nearSpot = s => hyp(h.x, h.y, s.x + s.w / 2, s.y + s.h / 2) < Math.max(s.w, s.h) / 2 + 56;
+  if (nearSpot(BAR)) {
+    if (G.chapter === 1 && G.stage === 0) { G.stage = 1; refreshObjective(); showDlg('龙叔：“阿杰，回来啦。先去东边枪店取把手枪防身，取到了再回来见我。”<br><button class="btn" onclick="document.getElementById(\'dlg\').classList.add(\'hidden\')">出发</button>'); }
+    else if (G.chapter === 1 && G.stage === 2) finishChapter(1);
+    else if (G.chapter === 2 && G.stage === 2) finishChapter(2);
+    else showDlg('龙叔：“按左上角目标走，遇到麻烦就开车甩掉他们。”<br><button class="btn" onclick="document.getElementById(\'dlg\').classList.add(\'hidden\')">知道了</button>');
+    return;
+  }
+  if (nearSpot(GUN)) {
+    if (G.chapter === 1 && G.stage === 1) { G.owned[1] = true; G.ammo[1] = 120; G.hero.weapon = 1; G.stage = 2; refreshObjective(); sfx.pickup(); showDlg('枪店老板：“手枪给你，子弹 120 发。回酒吧见龙叔。”<br><button class="btn" onclick="document.getElementById(\'dlg\').classList.add(\'hidden\')">收下</button>'); }
+    else {
+      showShop('<b>枪店</b><br>子弹 $50<button class="btn" id="shAmmo">买</button><br>冲锋枪 $800<button class="btn" id="shSmg">买</button><br>霰弹枪 $600<button class="btn" id="shSg">买</button><br>防弹衣 $300<button class="btn" id="shAr">买</button><br><button class="btn ghost" onclick="document.getElementById(\'shop\').classList.add(\'hidden\')">关闭</button>');
+      el('shAmmo') && (el('shAmmo').onclick = () => { if (G.money >= 50) { G.money -= 50; G.ammo[G.hero.weapon] += 30; toast('子弹 +30'); } else toast('钱不够'); });
+      el('shSmg') && (el('shSmg').onclick = () => { if (G.money >= 800) { G.money -= 800; G.owned[2] = true; G.ammo[2] = 240; toast('已购冲锋枪'); } else toast('钱不够'); });
+      el('shSg') && (el('shSg').onclick = () => { if (G.money >= 600) { G.money -= 600; G.owned[3] = true; G.ammo[3] = 40; toast('已购霰弹枪'); } else toast('钱不够'); });
+      el('shAr') && (el('shAr').onclick = () => { if (G.money >= 300) { G.money -= 300; G.hero.armor = 100; toast('防弹衣已穿'); } else toast('钱不够'); });
+    }
+    return;
+  }
+  if (nearSpot(CLINIC)) { if (G.money >= 100) { G.money -= 100; G.hero.hp = 100; toast('已治疗，生命回满'); } else toast('治疗要 $100，钱不够'); return; }
+  if (nearSpot(GARAGE)) { if (G.money >= 200) { G.money -= 200; G.wanted = 0; G.cops = []; G.heli = null; toast('已喷漆，通缉清零'); } else toast('喷漆要 $200，钱不够'); return; }
+  if (nearSpot(BANK) && G.chapter === 6) { toast('在金库门口站住坚守，警察会来，别离开太远'); return; }
+  if (car) boardCar(car);
+}
+function boardCar(car) {
+  const h = G.hero;
+  if (car.quest && G.chapter !== 4) { toast('这是送货货车，第四章才能开'); return; }
+  if (car.armoured) { toast('运钞车锁着，撞停它再说'); return; }
+  h.inCar = car; car.traffic = false;
+  if (car.quest) toast('送货货车，出发！'); // quest truck is never "stolen"
+  else if (car.pink) { toast('粉色跑车到手！开回酒吧'); if (G.chapter === 2) { G.stage = 1; refreshObjective(); } }
+  else if (!car.owned) { G.stats.stolen++; addWanted(1); toast('偷车！通缉 +1★'); }
+  else toast('上车了');
+  sfx.horn();
+}
+// ---------------- Combat ----------------
+function fireWeapon() {
+  const h = G.hero, w = GUNS[h.weapon];
+  if (h.fireCd > 0) return;
+  if (h.weapon > 0 && G.ammo[h.weapon] <= 0) { toast('没子弹了，去枪店买'); h.fireCd = 0.3; return; }
+  h.fireCd = w.rate; G.stats.fired++;
+  if (h.weapon > 0) G.ammo[h.weapon]--;
+  const a = h.angle; sfx.shoot(); G.shake = Math.max(G.shake, 2);
+  const n = w.pellets || 1;
+  for (let i = 0; i < n; i++) { const aa = a + (i - (n - 1) / 2) * 0.07 + rnd() * 0.02; G.shots.push({ x: h.x + Math.cos(a) * 22, y: h.y + Math.sin(a) * 22, vx: Math.cos(aa) * 620, vy: Math.sin(aa) * 620, dmg: w.dmg, life: w.range / 620, foe: false }); }
+}
+function hurtHero(dmg) {
+  const h = G.hero;
+  if (h.armor > 0) { const ab = Math.min(h.armor, dmg); h.armor -= ab; dmg -= ab; }
+  h.hp -= dmg; G.flash = 0.5; G.shake = Math.max(G.shake, 4);
+  if (h.hp <= 0) wasted();
+}
 
-function showDialog(html, ms) {
-  const d = $('dialog'); d.innerHTML = html; d.style.display = 'block';
-  if (ms) setTimeout(() => { if (d.innerHTML === html) d.style.display = 'none'; }, ms);
-}
-function hideDialog() { $('dialog').style.display = 'none'; }
-function banner(text) {
-  const b = $('banner'); b.textContent = text; b.style.display = 'block'; G.bannerTimer = 2.2;
-}
-function addEffect(x, y, text, color) { effects.push({ x, y, text, color: color || '#fff', t: 0 }); }
-function showScreen(name) {
-  G.screen = name;
-  $('startScreen').style.display = name === 'title' ? 'flex' : 'none';
-  $('pauseScreen').style.display = name === 'pause' ? 'flex' : 'none';
-  $('endScreen').style.display = (name === 'busted' || name === 'wasted' || name === 'win') ? 'flex' : 'none';
-  $('hud').style.display = name === 'play' || name === 'pause' ? 'block' : 'none';
-  $('objective').style.display = name === 'play' ? 'block' : 'none';
-  if (name === 'pause') $('pauseStats').textContent = statsText();
-}
-function statsText() {
-  const acc = G.shots ? Math.round(G.hits / G.shots * 100) : 0;
-  return `章节 ${G.chapter}/6 · 金钱 $${G.money} · 偷车 ${G.stolen} · 命中率 ${acc}% · 驾驶 ${Math.round(G.driveDist)}m · 最高通缉 ${G.maxWanted}★ · 包裹 ${G.pkgsGot}/20 · 完成度 ${completion()}%`;
-}
-function endGame(kind, title, text) {
-  G.screen = kind; $('endTitle').textContent = title; $('endText').textContent = text;
-  $('endStats').textContent = statsText(); showScreen(kind);
-  if (kind === 'win') { sPick(); }
-}
-
-// ---- interaction (E): vehicle <=52px wins over dialogue (56px) ----
-function doInteract() {
-  if (G.screen !== 'play') return;
-  if (P.car) { exitCar(); return; }
-  const car = nearCar();
-  if (car && Math.hypot(car.x - P.x, car.y - P.y) <= 52) { enterCar(car); return; }
-  const dBar = Math.hypot(P.x - city.bar.x, P.y - city.bar.y);
-  if (dBar <= 56) { talkBar(); return; }
-  if (Math.hypot(P.x - city.gunShop.x, P.y - city.gunShop.y) <= 56) { shopGun(); return; }
-  if (Math.hypot(P.x - city.hospital.x, P.y - city.hospital.y) <= 56) {
-    if (G.money >= 50 && G.hp < 100) { G.money -= 50; G.hp = 100; showDialog('医院：治疗完成，生命回满。(-$50)', 2500); } else showDialog('医院：治疗 $50，满血不用治。', 2500); return;
-  }
-  if (Math.hypot(P.x - city.carShop.x, P.y - city.carShop.y) <= 56) {
-    if (G.wanted > 0) { G.wanted = 0; police = []; heli = null; roadblocks = []; G.money = Math.max(0, G.money - 80); showDialog('车店：喷漆完成，通缉清零。(-$80)', 2500); }
-    else showDialog('车店：喷漆 / 修车。当前没有通缉。', 2500); return;
-  }
-  if (car) enterCar(car);
-}
-function enterCar(car) {
-  if (P.car) return;
-  if (car.ai) car.ai = null;
-  P.car = car; P.x = car.x; P.y = car.y;
-  if (!car.wasPlayersCar && !car.isStarter) {
-    G.stolen++; addWanted(1, 'steal');
-    showDialog(car.isPink ? '偷到了粉色跑车！通缉 +1★' : '偷车成功！通缉 +1★', 2200);
+// ---------------- Update ----------------
+let lastT = performance.now();
+function update(dt) {
+  if (G.mode !== 'play') return;
+  G.clock += dt * 2;
+  if (G.bannerT > 0) G.bannerT -= dt;
+  if (G.flash > 0) G.flash -= dt;
+  if (G.shake > 0) G.shake -= dt * 8;
+  const h = G.hero;
+  const wx = G.camX + (mouse.x - cv.width / 2), wy = G.camY + (mouse.y - cv.height / 2);
+  h.angle = Math.atan2(wy - h.y, wx - h.x);
+  if (h.fireCd > 0) h.fireCd -= dt;
+  if (mouse.down && !h.inCar) fireWeapon();
+  // --- walk / drive ---
+  if (h.inCar) {
+    const c = h.inCar;
+    const fwd = (keys['w'] || keys['arrowup'] ? 1 : 0) - (keys['s'] || keys['arrowdown'] ? 0.55 : 0);
+    const steer = (keys['a'] || keys['arrowleft'] ? 1 : 0) - (keys['d'] || keys['arrowright'] ? 1 : 0);
+    if (keys[' ']) c.speed *= Math.pow(0.02, dt);
+    c.speed += fwd * 260 * dt; c.speed *= Math.pow(0.4, dt); c.speed = clamp(c.speed, -120, 340);
+    if (Math.abs(c.speed) > 5) c.angle += steer * 1.9 * dt * Math.sign(c.speed) * (Math.abs(c.speed) / 200 + 0.3);
+    const ox = c.x, oy = c.y;
+    slideMove(c, Math.cos(c.angle) * c.speed * dt, Math.sin(c.angle) * c.speed * dt, 20);
+    if (Math.abs(c.x - ox) < 0.01 && Math.abs(c.y - oy) < 0.01 && Math.abs(c.speed) > 40) c.speed *= 0.92; // wedged: bleed speed
+    G.stats.driven += hyp(ox, oy, c.x, c.y) / 40;
+    h.x = c.x; h.y = c.y; h.angle = c.angle;
+    if (keys[' '] && Math.abs(c.speed) > 60 && rnd() < 0.5) G.shots.push({ x: c.x, y: c.y, vx: 0, vy: 0, dmg: 0, life: 0.01, foe: false, mark: true });
   } else {
-    showDialog(car.isQuestTruck ? '上了送货货车，按任务点送货。' : '上了你的车。', 1800);
+    const sp = (keys['shift'] ? 5.2 : 3.2) * 60 * dt;
+    let dx = 0, dy = 0;
+    if (keys['w'] || keys['arrowup']) dy -= 1; if (keys['s'] || keys['arrowdown']) dy += 1;
+    if (keys['a'] || keys['arrowleft']) dx -= 1; if (keys['d'] || keys['arrowright']) dx += 1;
+    if (dx || dy) { const L = Math.hypot(dx, dy); slideMove(h, dx / L * sp, dy / L * sp, 14); }
   }
-  if (car.isQuestTruck && G.chapter === 4 && G.missionActive && (G.step === 0 || G.step === 1)) { G.step = 2; G.deliveryIdx = 0; G.deliveryTimer = 150; setObjective('开货车去 4 个送货点', deliveryPoint()); }
-  if (car.isPink && G.chapter === 2 && G.missionActive) { G.step = 1; setObjective('把粉色跑车开回龙叔酒吧', { x: city.bar.x, y: city.bar.y, label: '龙叔酒吧' }); }
-}
-function exitCar() {
-  if (!P.car) return;
-  const c = P.car; P.car = null;
-  P.x = c.x + Math.cos(c.ang + Math.PI / 2) * 26; P.y = c.y + Math.sin(c.ang + Math.PI / 2) * 26;
-}
-function talkBar() {
-  if (!G.missionActive) {
-    G.missionActive = true; G.step = 0;
-    if (G.chapter === 1) { setObjective('去东边枪店取手枪', { x: city.gunShop.x, y: city.gunShop.y, label: '铁锤枪店' }); showDialog('龙叔：去东边枪店，老板有把手枪给你。拿了回来找我。', 4000); }
-    else if (G.chapter === 2) { setObjective('去偷粉色跑车', { x: city.pinkCarSpot.x, y: city.pinkCarSpot.y, label: '粉色跑车' }); showDialog('龙叔：北边停着辆粉色跑车，偷回来，开回酒吧。', 4000); }
-    else if (G.chapter === 3) { setObjective('去夜市打倒 7 名鲨鱼帮', { x: city.nightMarket.x, y: city.nightMarket.y, label: '夜市广场' }); spawnGang(); showDialog('龙叔：鲨鱼帮在夜市闹事，去教训他们，7 个人一个别放过。', 4000); }
-    else if (G.chapter === 4) { setObjective('先上黄色送货货车', { x: questTruck.x, y: questTruck.y, label: '送货货车' }); G.deliveryIdx = 0; G.deliveryTimer = 150; showDialog('龙叔：上那辆黄色货车，150 秒内送完 4 个点，超时算失败。', 4000); }
-    else if (G.chapter === 5) { setObjective('截停运钞车', null); spawnArmoured(); showDialog('龙叔：运钞车在城里绕圈，撞停或者打停它，抢钱袋。', 4000); }
-    else if (G.chapter === 6) { setObjective('去银行金库坚守 45 秒', { x: city.bank.x, y: city.bank.y, label: '银行' }); G.vaultTimer = 45; showDialog('龙叔：最后一票，银行金库门口守 45 秒，然后甩掉警察去南边码头。', 4000); }
-  } else if (G.chapter === 1 && G.step === 2) { completeChapter('第一章完成！龙叔给了你 $200。'); }
-  else showDialog('龙叔：按左上角的目标去做，粉色标记就是方向。', 2500);
-}
-function shopGun() {
-  if (G.chapter === 1 && G.missionActive && G.step === 0) {
-    P.owned[1] = true; P.ammo[1] = 60; P.weapon = 1; G.step = 2;
-    setObjective('拿着手枪回龙叔酒吧', { x: city.bar.x, y: city.bar.y, label: '龙叔酒吧' });
-    showDialog('枪店老板：手枪给你了，子弹 60 发。回酒吧找龙叔交差。', 3500); return;
-  }
-  const menu = [];
-  if (!P.owned[2] && G.money >= 300) menu.push('冲锋枪 $300');
-  if (!P.owned[3] && G.money >= 400) menu.push('霰弹枪 $400');
-  if (P.owned[1] && G.money >= 40) menu.push('手枪子弹 $40');
-  if (menu.length === 0) { showDialog('枪店：你已经买齐了，或者钱不够。手枪 $40 子弹，冲锋枪 $300，霰弹枪 $400。', 3000); return; }
-  // Buy the first affordable item in the list, one per visit, to keep E simple.
-  if (!P.owned[2] && G.money >= 300) { G.money -= 300; P.owned[2] = true; P.ammo[2] = 120; P.weapon = 2; showDialog('买到冲锋枪！子弹 120 发。', 2500); }
-  else if (!P.owned[3] && G.money >= 400) { G.money -= 400; P.owned[3] = true; P.ammo[3] = 24; P.weapon = 3; showDialog('买到霰弹枪！子弹 24 发。', 2500); }
-  else if (P.owned[1] && G.money >= 40) { G.money -= 40; P.ammo[1] += 60; showDialog('手枪子弹 +60。', 2000); }
-}
-function spawnGang() {
-  enemies = [];
-  for (let i = 0; i < 7; i++) {
-    const s = city.freeSpot(city.nightMarket.x + (i - 3) * 46, city.nightMarket.y + (i % 2 ? 40 : -40));
-    enemies.push({ x: s.x, y: s.y, hp: 50, speed: 58, color: '#8e44ad', isGang: true, fireCd: rand(0.5, 1.5) });
-  }
-  G.gangLeft = 7;
-}
-function deliveryPoint() {
-  const pts = [{ x: 300, y: 300, label: '送货点 1' }, { x: 1950, y: 900, label: '送货点 2' }, { x: 1250, y: 1450, label: '送货点 3' }, { x: 700, y: 250, label: '送货点 4' }];
-  return pts[G.deliveryIdx] || null;
-}
-function spawnArmoured() {
-  armoured = { x: 1200, y: 400, ang: 0, speed: 70, hp: 120, color: '#5d6d7e', kind: 'armoured', ai: { seg: city.segs[0], from: 0, to: 1, t: 0 }, stopped: false };
-  cars.push(armoured);
-}
-function setObjective(text, target) { G.missionText = text; G.target = target; $('objective').textContent = (G.missionActive ? `第 ${G.chapter} 章 · ` : '') + text; }
-function completeChapter(msg) {
-  G.money += 200; G.rep += 10; banner('MISSION PASSED'); sPick();
-  showDialog(msg + ' (+$200)', 4000);
-  G.missionActive = false; G.chapter++;
-  if (G.chapter > 6) { G.freeRoam = true; endGame('win', '🎉 通关！罪恶都市是你的了', '六章主线全部完成。你现在是这座城市的传奇。继续自由漫游，或回主菜单。'); return; }
-  G.step = 0; setObjective('去龙叔酒吧按 E 接下一章', { x: city.bar.x, y: city.bar.y, label: '龙叔酒吧' });
-}
-// ---- update ----
-function fireBullet() {
-  if (P.car || P.fireCd > 0) return;
-  const w = WEAPONS[P.weapon];
-  if (P.weapon > 0 && P.ammo[P.weapon] <= 0) { showDialog('没子弹了，去枪店买。', 1500); return; }
-  P.fireCd = w.rate; G.shots++;
-  if (P.weapon > 0) P.ammo[P.weapon]--;
-  sShoot();
-  const ang = P.ang;
-  const n = P.weapon === 3 ? 5 : 1;
-  for (let i = 0; i < n; i++) {
-    const spread = P.weapon === 3 ? (i - 2) * 0.09 : (Math.random() - 0.5) * 0.04;
-    bullets.push({ x: P.x + Math.cos(ang) * 20, y: P.y + Math.sin(ang) * 20, vx: Math.cos(ang + spread) * 620, vy: Math.sin(ang + spread) * 620, dmg: w.dmg, life: w.range / 620, fromPlayer: true });
-  }
-  G.shake = Math.max(G.shake, 3);
-}
-function stepUpdate(dt) {
-  G.time += dt * 12; G.clock += dt;
-  if (G.bannerTimer > 0) { G.bannerTimer -= dt; if (G.bannerTimer <= 0) $('banner').style.display = 'none'; }
-  // aim
-  const rect = canvas.getBoundingClientRect();
-  const wx = G.camX + (mouse.x - rect.left), wy = G.camY + (mouse.y - rect.top);
-  if (!P.car) P.ang = Math.atan2(wy - P.y, wx - P.x);
-  // movement
-  let ix = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
-  let iy = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.KeyW || keys.ArrowUp ? 1 : 0);
-  const sprint = keys.ShiftLeft || keys.ShiftRight;
-  if (P.car) {
-    const c = P.car;
-    const accel = 150, top = 260;
-    if (iy < 0) c.speed = Math.min(top, c.speed + accel * dt);
-    else if (iy > 0) c.speed = Math.max(-90, c.speed - accel * dt);
-    else c.speed *= (1 - 0.8 * dt);
-    if (keys.Space) c.speed *= (1 - 3 * dt);
-    if (ix !== 0 && Math.abs(c.speed) > 8) c.ang += ix * 2.1 * dt * Math.sign(c.speed);
-    const nx = c.x + Math.cos(c.ang) * c.speed * dt, ny = c.y + Math.sin(c.ang) * c.speed * dt;
-    if (!city.blocked(nx, ny, 16) && !city.inSea(nx, ny)) { c.x = nx; c.y = ny; G.driveDist += Math.abs(c.speed) * dt; }
-    else { c.speed *= -0.3; }
-    P.x = c.x; P.y = c.y; P.ang = c.ang;
-    if (Math.abs(c.speed) > 40 && Math.random() < dt * 4) effects.push({ x: c.x, y: c.y, text: '', color: '', t: 0, brake: true });
-  } else {
-    const sp = sprint ? 235 : 150;
-    const len = Math.hypot(ix, iy) || 1;
-    const nx = P.x + (ix / len) * sp * dt * (ix || iy ? 1 : 0), ny = P.y + (iy / len) * sp * dt * (ix || iy ? 1 : 0);
-    if (!city.blocked(nx, P.y, 13)) P.x = nx;
-    if (!city.blocked(P.x, ny, 13)) P.y = ny;
-  }
-  P.fireCd = Math.max(0, P.fireCd - dt);
-  if (mouse.down) fireBullet();
-  // traffic
-  for (const c of cars) {
-    if (c === P.car || !c.ai) continue;
-    const a = city.nodes[c.ai.from], b = city.nodes[c.ai.to];
-    const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1;
-    c.ai.t += c.speed * dt / segLen;
-    if (c.ai.t >= 1) {
-      c.ai.from = c.ai.to;
-      const next = city.adj[c.ai.to];
-      c.ai.to = next[Math.floor(Math.random() * next.length)];
-      c.ai.t = 0;
-    }
-    const na = city.nodes[c.ai.from], nb = city.nodes[c.ai.to];
-    c.x = na.x + (nb.x - na.x) * c.ai.t; c.y = na.y + (nb.y - na.y) * c.ai.t;
-    c.ang = Math.atan2(nb.y - na.y, nb.x - na.x);
-  }
-  if (armoured && !armoured.stopped && armoured.ai) {
-    const a = city.nodes[armoured.ai.from], b = city.nodes[armoured.ai.to];
-    const segLen = Math.hypot(b.x - a.x, b.y - a.y) || 1;
-    armoured.ai.t += armoured.speed * dt / segLen;
-    if (armoured.ai.t >= 1) { armoured.ai.from = armoured.ai.to; const nx = city.adj[armoured.ai.to]; armoured.ai.to = nx[Math.floor(Math.random() * nx.length)]; armoured.ai.t = 0; }
-    const na = city.nodes[armoured.ai.from], nb = city.nodes[armoured.ai.to];
-    armoured.x = na.x + (nb.x - na.x) * armoured.ai.t; armoured.y = na.y + (nb.y - na.y) * armoured.ai.t;
-    armoured.ang = Math.atan2(nb.y - na.y, nb.x - na.x);
-    if (P.car && Math.hypot(P.car.x - armoured.x, P.car.y - armoured.y) < 40 && Math.abs(P.car.speed) > 120) { armoured.hp -= 40; addEffect(armoured.x, armoured.y, '砰！'); }
-  }
-  // pedestrians wander, avoid buildings
-  for (const pd of peds) {
-    pd.wander -= dt;
-    if (pd.wander <= 0) { pd.ang = rand(0, 6.28); pd.wander = rand(2, 6); }
-    const nx = pd.x + Math.cos(pd.ang) * pd.speed * dt, ny = pd.y + Math.sin(pd.ang) * pd.speed * dt;
-    if (!city.blocked(nx, ny, 10) && !city.inLake(nx, ny)) { pd.x = nx; pd.y = ny; }
-    else pd.ang += Math.PI / 2;
-    if (P.car && Math.hypot(P.x - pd.x, P.y - pd.y) < 26 && Math.abs(P.car.speed) > 60) {
-      pd.hp = 0; addWanted(2, 'ped'); addEffect(pd.x, pd.y, '啊！', '#ff8fa3');
-      pd.x = rand(200, 2200); pd.y = rand(200, 1300); pd.hp = 30;
-    }
-  }
-  // enemies chase / shoot
-  for (const e of enemies) {
-    const d = Math.hypot(P.x - e.x, P.y - e.y);
-    if (d > 26) { const a = Math.atan2(P.y - e.y, P.x - e.x); e.x += Math.cos(a) * e.speed * dt; e.y += Math.sin(a) * e.speed * dt; }
-    e.fireCd -= dt;
-    if (d < 320 && e.fireCd <= 0) {
-      e.fireCd = 1.4;
-      const a = Math.atan2(P.y - e.y, P.x - e.x);
-      bullets.push({ x: e.x, y: e.y, vx: Math.cos(a) * 380, vy: Math.sin(a) * 380, dmg: 8, life: 1, fromPlayer: false });
-    }
-  }
-  // police
-  if (G.wanted > 0) {
-    let seen = false;
-    for (const po of police) {
-      const d = Math.hypot(P.x - po.x, P.y - po.y);
-      if (d < 520) seen = true;
-      const a = Math.atan2(P.y - po.y, P.x - po.x);
-      const sp = po.kind === 'car' ? 150 + G.wanted * 18 : 62;
-      po.ang = a;
-      const nx = po.x + Math.cos(a) * sp * dt, ny = po.y + Math.sin(a) * sp * dt;
-      if (!city.blocked(nx, ny, 14)) { po.x = nx; po.y = ny; }
-      if (po.kind === 'foot' && d < 30) { G.bustedTimer += dt; if (G.bustedTimer > 2.2) { endGame('busted', '🚨 被捕了', '警察把你按住了。通缉会清零，重新开始本章。'); return; } }
-      else if (po.kind === 'foot') G.bustedTimer = Math.max(0, G.bustedTimer - dt);
-      if (po.kind === 'car' && d < 34 && P.car) { P.car.speed *= 0.94; if (Math.random() < dt) { G.hp -= 2; G.vignette = 0.6; } }
-    }
-    if (!seen) { G.starsTimer += dt; if (G.starsTimer > 7) { G.wanted--; G.starsTimer = 0; if (G.wanted === 0) { police = []; heli = null; } } }
-    else G.starsTimer = 0;
-    if (G.wanted >= 5 && heli) { heli.x += (P.x - heli.x) * dt * 0.5; heli.y += (P.y - heli.y) * dt * 0.5; }
-  }
-  // bullets
-  for (const b of bullets) {
-    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
-    if (city.blocked(b.x, b.y, 4)) b.life = 0;
-    if (b.fromPlayer) {
-      for (const e of enemies) if (e.hp > 0 && Math.hypot(b.x - e.x, b.y - e.y) < 18) { e.hp -= b.dmg; b.life = 0; G.hits++; sHit(); addEffect(e.x, e.y, '✖', '#ffd23d'); if (e.hp <= 0) { G.kills++; addEffect(e.x, e.y, '☠', '#ff5b5b'); if (e.isGang) G.gangLeft--; } break; }
-      if (b.life > 0) for (const po of police) if (po.hp > 0 && Math.hypot(b.x - po.x, b.y - po.y) < 18) { po.hp -= b.dmg; b.life = 0; G.hits++; addWanted(1, 'police'); if (po.hp <= 0) { po.hp = 0; addEffect(po.x, po.y, '☠'); } break; }
-      if (b.life > 0 && armoured && !armoured.stopped && Math.hypot(b.x - armoured.x, b.y - armoured.y) < 26) { armoured.hp -= b.dmg; b.life = 0; G.hits++; if (armoured.hp <= 0) { armoured.stopped = true; armoured.speed = 0; G.moneyBag = { x: armoured.x + 40, y: armoured.y + 20 }; setObjective('下车捡绿色钱袋', { x: G.moneyBag.x, y: G.moneyBag.y, label: '钱袋' }); } }
+  // --- autopilot (driving test): BFS route, steer node to node ---
+  if (G.pilot) {
+    const ap = G.pilot;
+    if (!ap.path || ap.idx >= ap.path.length) {
+      G.pilot = null;
+      if (G.testMode && G.testMode !== 'ch4') { G.testResult = 'DRIVE OK arrived ' + Math.round(G.testClock) + 's'; finishTest(); }
     } else {
-      if (Math.hypot(b.x - P.x, b.y - P.y) < 16) {
-        b.life = 0;
-        if (G.armour > 0) G.armour = Math.max(0, G.armour - b.dmg); else G.hp -= b.dmg;
-        G.vignette = 0.7; G.shake = Math.max(G.shake, 5);
-        if (G.hp <= 0) { G.hp = 0; endGame('wasted', '💀 你被打倒了', '生命耗尽。重新开始本章，通缉清零。'); return; }
-      }
-    }
-  }
-  bullets = bullets.filter(b => b.life > 0);
-  enemies = enemies.filter(e => e.hp > 0);
-  police = police.filter(p => p.hp > 0 || p.kind === 'car');
-  // packages
-  for (const pk of city.packages) if (!pk.got && Math.hypot(P.x - pk.x, P.y - pk.y) < 24) { pk.got = true; G.pkgsGot++; G.money += 50; sPick(); addEffect(pk.x, pk.y, '+$50', '#ffd23d'); }
-  // missions progress
-  if (G.missionActive) {
-    if (G.chapter === 2 && G.step === 1 && !P.car) { /* need car */ }
-    if (G.chapter === 2 && G.step === 1 && P.car && P.car.isPink && Math.hypot(P.x - city.bar.x, P.y - city.bar.y) < 130) completeChapter('第二章完成！粉色跑车交货了。');
-    if (G.chapter === 3 && G.gangLeft <= 0 && enemies.length === 0) completeChapter('第三章完成！夜市清净了。');
-    if (G.chapter === 4) {
-      G.deliveryTimer -= dt;
-      if (G.deliveryTimer <= 0) { showDialog('送货超时，任务失败，回酒吧重接。', 3500); G.missionActive = false; G.step = 0; setObjective('去龙叔酒吧按 E 重接任务', { x: city.bar.x, y: city.bar.y, label: '龙叔酒吧' }); }
-      else if (G.step === 2 && P.car && P.car.isQuestTruck) {
-        const pt = deliveryPoint();
-        if (pt && Math.hypot(P.x - pt.x, P.y - pt.y) < 85) {
-          G.deliveryIdx++; sPick();
-          if (G.deliveryIdx >= 4) completeChapter('第四章完成！四站都送到了。');
-          else setObjective(`开货车去送货点 ${G.deliveryIdx + 1}（剩 ${Math.ceil(G.deliveryTimer)} 秒）`, deliveryPoint());
+      const tgt = pt(ap.path[ap.idx]);
+      const c = h.inCar;
+      if (!c) G.pilot = null;
+      else {
+        const d = hyp(c.x, c.y, tgt.x, tgt.y);
+        if (d < 90) { ap.idx++; if (ap.idx >= ap.path.length) { G.pilot = null; if (G.testMode !== 'ch4') { G.testResult = 'DRIVE OK arrived ' + Math.round(G.testClock) + 's'; finishTest(); } } }
+        else {
+          const want = Math.atan2(tgt.y - c.y, tgt.x - c.x), diff = wrapAngle(want, c.angle);
+          c.angle += clamp(diff, -4.5 * dt, 4.5 * dt);
+          const targetSpeed = Math.abs(diff) > 0.7 ? 110 : (d < 100 ? 170 : 330);
+          c.speed += clamp(targetSpeed - c.speed, -300 * dt, 260 * dt);
+          const ox = c.x, oy = c.y;
+          slideMove(c, Math.cos(c.angle) * c.speed * dt, Math.sin(c.angle) * c.speed * dt, 20);
+          G.stats.driven += hyp(ox, oy, c.x, c.y) / 40;
+          h.x = c.x; h.y = c.y;
         }
-      } else if (G.step === 2 && (!P.car || !P.car.isQuestTruck)) {
-        showDialog('送货必须开那辆黄色货车！按 E 上车。', 2000);
       }
-    }
-    if (G.chapter === 5 && G.moneyBag && !P.car && Math.hypot(P.x - G.moneyBag.x, P.y - G.moneyBag.y) < 26) {
-      G.moneyBag = null; G.money += 1000; setObjective('甩掉警察（通缉清零）', null);
-      showDialog('抢到 $1000！现在甩掉警察：躲开视线 7 秒消一星，或去车店喷漆。', 4000);
-    }
-    if (G.chapter === 5 && !G.moneyBag && armoured && armoured.stopped && G.wanted === 0 && G.missionActive) completeChapter('第五章完成！运钞车得手了。');
-    if (G.chapter === 6) {
-      if (G.step === 0 && Math.hypot(P.x - city.bank.x, P.y - city.bank.y) < 110) {
-        G.step = 1; if (G.wanted < 2) addWanted(2, 'bank');
-        setObjective(`坚守金库门口：剩 ${Math.ceil(G.vaultTimer)} 秒`, { x: city.bank.x, y: city.bank.y, label: '银行' });
-      } else if (G.step === 1) {
-        if (Math.hypot(P.x - city.bank.x, P.y - city.bank.y) < 110) G.vaultTimer -= dt;
-        setObjective(`坚守金库门口：剩 ${Math.ceil(Math.max(0, G.vaultTimer))} 秒`, { x: city.bank.x, y: city.bank.y, label: '银行' });
-        if (G.vaultTimer <= 0) { G.step = 2; setObjective('甩掉警察，去南边码头', { x: city.dock.x, y: city.dock.y, label: '南码头' }); }
-      } else if (G.step === 2 && G.wanted === 0 && Math.hypot(P.x - city.dock.x, P.y - city.dock.y) < 110) completeChapter('第六章完成！你从码头全身而退。');
+      G.testClock += dt;
+      if (G.testClock > 60 && G.testMode !== 'ch4' && ap.path) { G.testResult = 'DRIVE FAIL timeout'; G.pilot = null; finishTest(); }
     }
   }
-  // camera + fx decay
-  G.camX = Math.max(0, Math.min(WORLD_W - canvas.width, P.x - canvas.width / 2));
-  G.camY = Math.max(0, Math.min(WORLD_H - canvas.height, P.y - canvas.height / 2));
-  G.shake = Math.max(0, G.shake - dt * 14);
-  G.vignette = Math.max(0, G.vignette - dt * 0.5);
-  for (const e of effects) e.t += dt;
-  effects = effects.filter(e => e.t < 1.2);
-  updateHUD();
+  // --- traffic: drive segment by segment, pick a random road at each junction ---
+  for (const c of G.cars) {
+    if (!c.traffic || c.dead) continue;
+    const [a, b] = ROADS[c.edge]; const A = pt(a), B = pt(b);
+    const len = hyp(A.x, A.y, B.x, B.y) || 1, step = 55 * dt / len;
+    c.t += step * c.dir;
+    if (c.t >= 1 || c.t <= 0) {
+      const atNode = c.t >= 1 ? b : a;
+      const opts = ROADS.map((e, i) => ({ e, i })).filter(o => o.e[0] === atNode || o.e[1] === atNode);
+      const o = choice(opts); c.edge = o.i; const [na, nb] = o.e; c.dir = na === atNode ? 1 : -1; c.t = c.dir > 0 ? 0 : 1;
+    }
+    const [na, nb] = ROADS[c.edge]; const NA = pt(na), NB = pt(nb);
+    c.x = NA.x + (NB.x - NA.x) * c.t; c.y = NA.y + (NB.y - NA.y) * c.t;
+    c.angle = Math.atan2(NB.y - NA.y, NB.x - NA.x) + (c.dir < 0 ? Math.PI : 0);
+  }
+  if (G.truck && !G.truck.dead && G.truckHp > 0) G.truck.traffic = true; // armoured truck keeps looping
+  // --- pedestrians wander ---
+  for (const w of G.walkers) {
+    if (w.wait > 0) { w.wait -= dt; continue; }
+    if (hyp(w.x, w.y, w.tx, w.ty) < 8) { w.tx = clamp(w.x + between(-160, 160), 80, MAP_W - 80); w.ty = clamp(w.y + between(-160, 160), 80, 2000); w.wait = between(0, 1.5); continue; }
+    w.angle = Math.atan2(w.ty - w.y, w.tx - w.x);
+    slideMove(w, Math.cos(w.angle) * w.speed * dt, Math.sin(w.angle) * w.speed * dt, 12);
+  }
+  // --- bullets (foe bullets never hit their own shooter) ---
+  for (const b of G.shots) {
+    if (b.mark) continue;
+    b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+    if (b.foe) continue;
+    if (hitsHouse(b.x, b.y, 2)) { b.life = 0; continue; }
+    for (const e of G.foes) if (e.hp > 0 && hyp(b.x, b.y, e.x, e.y) < 20) { e.hp -= b.dmg; G.stats.landed++; b.life = 0; sfx.hit(); if (e.hp <= 0) { G.money += 80; G.gangLeft = Math.max(0, G.gangLeft - 1); refreshObjective(); if (G.chapter === 3 && G.gangLeft <= 0) finishChapter(3); } }
+    if (G.truck && G.chapter === 5 && !G.bagOut && hyp(b.x, b.y, G.truck.x, G.truck.y) < 30) { G.truckHp -= b.dmg; G.stats.landed++; b.life = 0; if (G.truckHp <= 0) dropBag(); }
+    for (const pc of G.cops) if (pc.hp > 0 && hyp(b.x, b.y, pc.x, pc.y) < 20) { pc.hp -= b.dmg; G.stats.landed++; b.life = 0; addWanted(1); if (pc.hp <= 0) pc.dead = true; }
+    for (const w of G.walkers) if (w.hp > 0 && hyp(b.x, b.y, w.x, w.y) < 16) { w.hp -= b.dmg; G.stats.landed++; b.life = 0; addWanted(1); if (w.hp <= 0) { w.hp = 0; w.wait = 999; } }
+  }
+  G.shots = G.shots.filter(b => b.life > 0);
+  // --- gang / foe behaviour ---
+  for (const e of G.foes) {
+    if (e.hp <= 0) continue;
+    const d = hyp(e.x, e.y, h.x, h.y);
+    if (d > 320) { const a = Math.atan2(h.y - e.y, h.x - e.x); slideMove(e, Math.cos(a) * 70 * dt, Math.sin(a) * 70 * dt, 14); }
+    else if (d < 26) hurtHero(8 * dt * 3);
+    else if (rnd() < dt * 0.35) { const a = Math.atan2(h.y - e.y, h.x - e.x); G.shots.push({ x: e.x, y: e.y, vx: Math.cos(a) * 260, vy: Math.sin(a) * 260, dmg: 5, life: 1.2, foe: true }); }
+  }
+  for (const b of G.shots) if (b.foe && hyp(b.x, b.y, h.x, h.y) < 16) { hurtHero(b.dmg); b.life = 0; }
+  // --- hidden packages ---
+  for (const pk of G.packs) if (!pk.got && hyp(h.x, h.y, pk.x, pk.y) < 28) { pk.got = true; G.money += 100; G.rep += 2; sfx.pickup(); toast('隐藏包裹！+$100（' + G.packs.filter(q => q.got).length + '/20）'); }
+  updateMissions(dt);
+  updatePolice(dt);
+  if (radioOn) { radioTick -= dt; if (radioTick <= 0) { radioTick = 0.22; tone(choice([262, 330, 392, 523, 440]), 0.18, 'triangle', 0.03); } }
+  G.camX = clamp(h.x, 640, MAP_W - 640); G.camY = clamp(h.y, 360, MAP_H - 360);
+}
+function dropBag() {
+  const c = G.truck; c.dead = true; c.traffic = false; G.bagOut = true; G.bagAt = { x: c.x + 40, y: c.y };
+  addWanted(2); showBanner('运钞车停下了！捡绿色钱袋'); sfx.coin();
+}
+function updateMissions(dt) {
+  const h = G.hero;
+  if (G.chapter === 3 && G.gangLeft === 0 && G.stage === 0) {
+    G.stage = 1; G.foes = [];
+    for (let i = 0; i < 7; i++) G.foes.push({ x: MARKET.x + 20 + rnd() * (MARKET.w - 40), y: MARKET.y + 20 + rnd() * (MARKET.h - 40), hp: 60 });
+    G.gangLeft = 7; refreshObjective(); showBanner('鲨鱼帮来了！击败 7 人');
+    showDlg('龙叔：“鲨鱼帮在夜市闹事，去教训他们 7 个。”<br><button class="btn" onclick="document.getElementById(\'dlg\').classList.add(\'hidden\')">开打</button>');
+  }
+  if (G.chapter === 4) {
+    const q = G.cars.find(c => c.quest);
+    if (G.stage === 0) { if (h.inCar === q) { G.stage = 1; G.shipTimer = 150; refreshObjective(); showBanner('送货开始！150 秒，4 个点'); } }
+    else {
+      G.shipTimer -= dt;
+      const p = DELIVERY_POINTS[G.shipIdx];
+      if (h.inCar === q && hyp(h.x, h.y, p[0], p[1]) < 100) {
+        G.shipIdx++; G.money += 150; sfx.coin();
+        if (G.shipIdx >= 4) finishChapter(4); else { refreshObjective(); showBanner('已送 ' + G.shipIdx + '/4'); }
+      }
+      if (G.shipTimer <= 0) { G.shipTimer = 150; G.shipIdx = 0; G.stage = 0; refreshObjective(); showBanner('超时！回货车重新开始'); toast('送货超时，已重置'); }
+      refreshObjective();
+    }
+  }
+  if (G.chapter === 5) {
+    if (G.bagOut && !G.bagTaken && hyp(h.x, h.y, G.bagAt.x, G.bagAt.y) < 30) { G.bagTaken = true; G.money += 2000; G.gold += 2; sfx.coin(); showBanner('钱袋到手！甩掉警察'); refreshObjective(); }
+    if (G.bagTaken && G.wanted === 0) finishChapter(5);
+  }
+  if (G.chapter === 6) {
+    const inZone = hyp(h.x, h.y, BANK.x + 65, BANK.y + 45) < 130;
+    if (G.vault < 45 && inZone && !h.inCar) {
+      G.vault += dt;
+      const tier = Math.floor(G.vault / 15); // wanted rises at most once per 15s tier
+      if (tier > G.vaultTier) { G.vaultTier = tier; addWanted(1); }
+      refreshObjective();
+    }
+    if (G.vault >= 45 && hyp(h.x, h.y, DOCK.x, DOCK.y) < 90 && G.wanted === 0) finishChapter(6);
+    if (G.vault >= 45) refreshObjective();
+  }
+  if (G.chapter === 2 && G.stage === 1 && hyp(h.x, h.y, BAR.x + 60, BAR.y + 40) < 110 && h.inCar && h.inCar.pink) {
+    G.stage = 2; h.inCar = null; finishChapter(2);
+  }
+}
+function updatePolice(dt) {
+  const h = G.hero;
+  const wantN = G.wanted === 0 ? 0 : G.wanted <= 2 ? 2 : G.wanted <= 3 ? 3 : 4;
+  while (G.cops.length < wantN) G.cops.push({ x: h.x + between(-500, 500), y: h.y + between(-500, 500), hp: 80, dead: false });
+  if (G.cops.length > wantN) G.cops.length = wantN;
+  if (G.wanted >= 5 && !G.heli) G.heli = { x: h.x, y: h.y };
+  if (G.wanted < 5) G.heli = null;
+  let anyNear = false;
+  for (const pc of G.cops) {
+    if (pc.dead) continue;
+    const d = hyp(pc.x, pc.y, h.x, h.y); if (d < 420) anyNear = true;
+    const a = Math.atan2(h.y - pc.y, h.x - pc.x);
+    slideMove(pc, Math.cos(a) * 95 * dt, Math.sin(a) * 95 * dt, 14);
+    if (d < 24 && !h.inCar) { hurtHero(5 * dt * 3); G.bustedTimer += dt; if (G.bustedTimer > 2.2) { G.bustedTimer = 0; busted(); } }
+    else if (d > 60) G.bustedTimer = Math.max(0, G.bustedTimer - dt);
+  }
+  if (G.heli) { G.heli.x += (h.x - G.heli.x) * dt * 0.8; G.heli.y += (h.y - G.heli.y) * dt * 0.8; }
+  if (G.wanted > 0) {
+    if (!anyNear) { G.outOfSight += dt; if (G.outOfSight > 7) { G.wanted--; G.outOfSight = 0; refreshObjective(); toast('通缉 -1★，现在 ' + G.wanted + '★'); } }
+    else G.outOfSight = 0;
+  }
 }
 
-// ---- render ----
-function drawCar(c) {
-  ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.ang);
-  const w = c.kind === 'truck' || c.kind === 'armoured' ? 52 : 42, h = 22;
-  ctx.fillStyle = '#0008'; ctx.fillRect(-w / 2 + 2, -h / 2 + 3, w, h);
-  ctx.fillStyle = c.color; ctx.beginPath(); ctx.roundRect(-w / 2, -h / 2, w, h, 6); ctx.fill();
-  ctx.fillStyle = '#bfe8ff'; ctx.fillRect(-4, -h / 2 + 3, 14, h - 6);
-  if (c.isQuestTruck) { ctx.strokeStyle = '#ffd23d'; ctx.lineWidth = 3; ctx.strokeRect(-w / 2 - 2, -h / 2 - 2, w + 4, h + 4); }
-  if (c.isPolice || c.color === '#2233ff') { ctx.fillStyle = '#fff'; ctx.fillRect(-w / 2 + 4, -4, 10, 8); }
+// ---------------- Render ----------------
+function districtAt(x, y) {
+  if (y > BEACH_Y) return '南海滩';
+  if (x > PORT.x - 40 && y > PORT.y - 40) return '港口工业区';
+  if (x > PARK.x && x < PARK.x + PARK.w && y > PARK.y && y < PARK.y + PARK.h) return '中央公园';
+  if (x > MARKET.x && x < MARKET.x + MARKET.w && y > MARKET.y && y < MARKET.y + MARKET.h) return '夜市广场';
+  if (x > 1300 && x < 2300 && y < 900) return '市中心';
+  if (x < 800 && y > 1400) return '住宅区';
+  return '罪恶都市';
+}
+function drawCarShape(c) {
+  ctx.save(); ctx.translate(c.x, c.y); ctx.rotate(c.angle);
+  ctx.fillStyle = c.colour; ctx.fillRect(-22, -11, 44, 22);
+  ctx.fillStyle = 'rgba(255,255,255,.5)'; ctx.fillRect(-4, -10, 12, 20);
+  if (c.quest) { ctx.strokeStyle = '#ffd400'; ctx.lineWidth = 3; ctx.strokeRect(-24, -13, 48, 26); ctx.fillStyle = '#ffd400'; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('送货货车', 0, -16); }
+  if (c.owned) { ctx.fillStyle = '#00d0d0'; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('你的车', 0, -16); }
+  if (c.pink) { ctx.fillStyle = '#ff69b4'; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('粉色跑车', 0, -16); }
   ctx.restore();
-  if (c.isStarter) { ctx.fillStyle = '#2fd6d6'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('你的车·按 E 上车', c.x, c.y - 20); }
-  if (c.isQuestTruck) { ctx.fillStyle = '#ffd23d'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('🚚 送货货车', c.x, c.y - 24); }
-  if (c.isPink) { ctx.fillStyle = '#ff7ad9'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('粉色跑车', c.x, c.y - 20); }
 }
 function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#0b1020'; ctx.fillRect(0, 0, cv.width, cv.height);
+  if (G.mode === 'menu') return;
   const sx = (Math.random() - 0.5) * G.shake, sy = (Math.random() - 0.5) * G.shake;
-  ctx.save(); ctx.translate(-G.camX + sx, -G.camY + sy);
-  // ground
-  ctx.fillStyle = '#3f7a44'; ctx.fillRect(0, 0, WORLD_W, WORLD_H);
-  // sea + beach
-  ctx.fillStyle = '#1b6fa8'; ctx.fillRect(0, SEA_Y, WORLD_W, WORLD_H - SEA_Y);
-  ctx.fillStyle = '#e8d9a0'; ctx.fillRect(0, BEACH_Y, WORLD_W, SEA_Y - BEACH_Y);
-  // pier
-  ctx.fillStyle = '#8a6a45'; ctx.fillRect(2160, 1480, 36, 110);
-  ctx.fillStyle = '#6b4f2a'; for (let i = 0; i < 5; i++) ctx.fillRect(2160, 1485 + i * 22, 36, 4);
-  // park + lake + circular paths
-  ctx.fillStyle = '#2f8f3a'; ctx.beginPath(); ctx.arc(city.park.x, city.park.y, city.park.r, 0, 6.29); ctx.fill();
-  ctx.strokeStyle = '#e8d9a0'; ctx.lineWidth = 6; ctx.beginPath(); ctx.arc(city.park.x, city.park.y, 130, 0, 6.29); ctx.stroke();
-  ctx.fillStyle = '#2a9fd8'; ctx.beginPath(); ctx.arc(city.park.x, city.park.y, city.park.lakeR, 0, 6.29); ctx.fill();
-  ctx.fillStyle = '#fff'; ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('中央公园', city.park.x, city.park.y - 150);
-  // night market square
-  ctx.fillStyle = '#c9a86a'; ctx.fillRect(city.nightMarket.x - 90, city.nightMarket.y - 70, 180, 140);
-  ctx.fillStyle = '#2a9fd8'; ctx.beginPath(); ctx.arc(city.nightMarket.x, city.nightMarket.y, 18, 0, 6.29); ctx.fill();
-  ctx.fillStyle = '#ff5b5b';
-  for (let i = 0; i < 4; i++) ctx.fillRect(city.nightMarket.x - 70 + i * 38, city.nightMarket.y - 58, 26, 18);
-  ctx.fillStyle = '#222'; ctx.fillText('夜市广场', city.nightMarket.x, city.nightMarket.y + 62);
-  // port containers
-  ctx.fillStyle = '#c0392b'; ctx.fillRect(180, 1240, 70, 26); ctx.fillStyle = '#2980b9'; ctx.fillRect(180, 1280, 70, 26); ctx.fillStyle = '#f39c12'; ctx.fillRect(260, 1260, 70, 26);
-  ctx.fillStyle = '#222'; ctx.fillText('港口', 240, 1230);
-  // parking lots
-  ctx.fillStyle = '#444'; for (const [x, y] of [[600, 500], [1500, 1000], [1000, 1450]]) ctx.fillRect(x, y, 110, 60);
-  // roads
-  ctx.strokeStyle = '#2c2f36'; ctx.lineCap = 'round';
-  for (const s of city.segs) {
-    const a = city.nodes[s.a], b = city.nodes[s.b];
-    ctx.lineWidth = 26; ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
-    ctx.strokeStyle = '#ffd23d'; ctx.lineWidth = 2; ctx.setLineDash([14, 14]);
-    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); ctx.setLineDash([]);
-    ctx.strokeStyle = '#2c2f36';
+  const ox = cv.width / 2 - G.camX + sx, oy = cv.height / 2 - G.camY + sy;
+  ctx.save(); ctx.translate(ox, oy);
+  ctx.fillStyle = '#3f7a44'; ctx.fillRect(0, 0, MAP_W, BEACH_Y);
+  ctx.fillStyle = '#e8d8a0'; ctx.fillRect(0, BEACH_Y, MAP_W, SEA_Y - BEACH_Y);
+  ctx.fillStyle = '#1a6fb0'; ctx.fillRect(0, SEA_Y, MAP_W, MAP_H - SEA_Y);
+  ctx.fillStyle = '#2f6b33'; ctx.fillRect(PARK.x, PARK.y, PARK.w, PARK.h);
+  ctx.fillStyle = '#2a9fd8'; ctx.beginPath(); ctx.ellipse(LAKE.x, LAKE.y, LAKE.rx, LAKE.ry, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#8a7a5a'; ctx.fillRect(MARKET.x, MARKET.y, MARKET.w, MARKET.h);
+  ctx.fillStyle = '#6a6a72'; ctx.fillRect(PORT.x, PORT.y, PORT.w, PORT.h);
+  ctx.fillStyle = '#8a6a42'; ctx.fillRect(DOCK.x - 14, DOCK.y, 28, 150);
+  ctx.fillStyle = '#555'; for (const l of LOTS) ctx.fillRect(l.x, l.y, l.w, l.h);
+  ctx.strokeStyle = '#2b2b33'; ctx.lineCap = 'round';
+  for (const [a, b] of ROADS) { const A = pt(a), B = pt(b); ctx.lineWidth = 64; ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke(); }
+  ctx.strokeStyle = '#d8d8d8'; ctx.lineWidth = 2; ctx.setLineDash([18, 18]);
+  for (const [a, b] of ROADS) { const A = pt(a), B = pt(b); ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke(); }
+  ctx.setLineDash([]);
+  for (const t of TREES) { ctx.fillStyle = t.palm ? '#2a8a3a' : '#1f6b2a'; ctx.beginPath(); ctx.arc(t.x, t.y, 12, 0, 7); ctx.fill(); ctx.fillStyle = '#6a4a22'; ctx.fillRect(t.x - 2, t.y - 2, 4, 4); }
+  for (const c of CRATES) { ctx.fillStyle = c.colour; ctx.fillRect(c.x, c.y, c.w, c.h); }
+  for (const b of HOUSES) {
+    ctx.fillStyle = '#222'; ctx.fillRect(b.x - 3, b.y - 3, b.w + 6, b.h + 6);
+    ctx.fillStyle = b.colour; ctx.fillRect(b.x, b.y, b.w, b.h);
+    if (b.roof === 1) { ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.fillRect(b.x + 6, b.y + 6, b.w - 12, 10); }
+    if (b.roof === 2) { ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.moveTo(b.x, b.y + b.h); ctx.lineTo(b.x + b.w / 2, b.y); ctx.lineTo(b.x + b.w, b.y + b.h); ctx.fill(); }
+    if (b.roof === 3) { ctx.fillStyle = 'rgba(255,255,255,.35)'; for (let i = 0; i < 3; i++) ctx.fillRect(b.x + 8 + i * 14, b.y + 8, 8, b.h - 16); }
+    if (b.label) { ctx.fillStyle = '#fff'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 4); }
   }
-  // zebra crossings at a few nodes
-  ctx.fillStyle = '#eee';
-  for (const n of city.nodes.slice(0, 12)) for (let i = -2; i <= 2; i++) ctx.fillRect(n.x + i * 8 - 3, n.y - 18, 5, 10);
-  // buildings
-  for (const b of city.buildings) {
-    ctx.fillStyle = b.type === 'highrise' ? '#5a7a9a' : b.type === 'warehouse' ? '#8a7a5a' : b.type === 'house' ? '#c98a6a' : '#7a8a9a';
-    ctx.fillRect(b.x, b.y, b.w, b.h);
-    ctx.fillStyle = b.type === 'highrise' ? '#9fc4e8' : '#fff8';
-    ctx.fillRect(b.x + 6, b.y + 6, b.w - 12, b.h - 12);
-    ctx.fillStyle = '#2228';
-    for (let wx = b.x + 12; wx < b.x + b.w - 10; wx += 16) for (let wy = b.y + 12; wy < b.y + b.h - 10; wy += 16) ctx.fillRect(wx, wy, 7, 9);
+  for (const pk of G.packs) { if (pk.got) continue; ctx.fillStyle = '#ffd700'; ctx.fillRect(pk.x - 7, pk.y - 7, 14, 14); ctx.fillStyle = '#000'; ctx.font = 'bold 10px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('?', pk.x, pk.y + 4); }
+  const mk = missionSpot();
+  if (mk && G.chapter <= 6) {
+    ctx.strokeStyle = '#ff2e88'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(mk.x, mk.y, 26 + Math.sin(performance.now() / 300) * 5, 0, 7); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,46,136,.18)'; ctx.fillRect(mk.x - 8, mk.y - 400, 16, 400);
+    ctx.fillStyle = '#ff2e88'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('▼', mk.x, mk.y - 34);
   }
-  // shops / landmarks
-  function marker(x, y, label, color) {
-    ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, 16, 0, 6.29); ctx.fill();
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(label, x, y - 24);
+  for (const c of G.cars) { if (c.dead && c.armoured) continue; drawCarShape(c); }
+  for (const w of G.walkers) { if (w.hp <= 0) continue; ctx.fillStyle = '#f0d0a0'; ctx.beginPath(); ctx.arc(w.x, w.y, 10, 0, 7); ctx.fill(); ctx.fillStyle = '#ddd'; ctx.fillRect(w.x - 8, w.y - 6, 16, 10); }
+  for (const e of G.foes) {
+    if (e.hp <= 0) continue;
+    ctx.fillStyle = '#c0392b'; ctx.beginPath(); ctx.arc(e.x, e.y, 12, 0, 7); ctx.fill();
+    ctx.fillStyle = '#000'; ctx.fillRect(e.x - 14, e.y - 22, 28, 5);
+    ctx.fillStyle = '#f00'; ctx.fillRect(e.x - 14, e.y - 22, 28 * e.hp / 60, 5);
   }
-  marker(city.bar.x, city.bar.y, '🍺 龙叔酒吧', '#ff5b9a');
-  marker(city.gunShop.x, city.gunShop.y, '🔫 枪店', '#e67e22');
-  marker(city.hospital.x, city.hospital.y, '🏥 医院', '#2ecc71');
-  marker(city.carShop.x, city.carShop.y, '🚗 车店', '#4db2ff');
-  marker(city.bank.x, city.bank.y, '🏦 银行', '#ffd23d');
-  marker(city.dock.x, city.dock.y, '⚓ 南码头', '#7fd0ff');
-  // palm trees on beach
-  ctx.fillStyle = '#2f8f3a';
-  for (let x = 200; x < 2300; x += 260) { ctx.beginPath(); ctx.arc(x, 1530, 14, 0, 6.29); ctx.fill(); ctx.fillStyle = '#8a6a45'; ctx.fillRect(x - 2, 1530, 4, 16); ctx.fillStyle = '#2f8f3a'; }
-  // packages
-  for (const pk of city.packages) if (!pk.got) {
-    ctx.fillStyle = '#ffd23d'; ctx.beginPath(); ctx.arc(pk.x, pk.y, 9, 0, 6.29); ctx.fill();
-    ctx.fillStyle = '#222'; ctx.font = 'bold 11px sans-serif'; ctx.fillText('?', pk.x, pk.y + 4);
-  }
-  if (G.moneyBag) { ctx.fillStyle = '#2ecc71'; ctx.beginPath(); ctx.arc(G.moneyBag.x, G.moneyBag.y, 12, 0, 6.29); ctx.fill(); ctx.fillStyle = '#fff'; ctx.font = 'bold 13px sans-serif'; ctx.fillText('$', G.moneyBag.x, G.moneyBag.y + 5); }
-  // roadblocks
-  ctx.fillStyle = '#ff5b5b';
-  for (const rb of roadblocks) { ctx.fillRect(rb.x - 22, rb.y - 8, 44, 16); ctx.fillStyle = '#fff'; ctx.font = 'bold 11px sans-serif'; ctx.fillText('路障', rb.x, rb.y + 4); ctx.fillStyle = '#ff5b5b'; }
-  // objective sky beam + marker
-  if (G.target) {
-    ctx.strokeStyle = '#ff5b9a88'; ctx.lineWidth = 22; ctx.beginPath(); ctx.moveTo(G.target.x, G.target.y - 300); ctx.lineTo(G.target.x, G.target.y); ctx.stroke();
-    ctx.fillStyle = '#ff5b9a'; ctx.beginPath(); ctx.arc(G.target.x, G.target.y, 12, 0, 6.29); ctx.fill();
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'; ctx.fillText(G.target.label || '目标', G.target.x, G.target.y - 20);
-  }
-  // pedestrians
-  for (const pd of peds) { ctx.fillStyle = pd.color; ctx.beginPath(); ctx.arc(pd.x, pd.y, 9, 0, 6.29); ctx.fill(); ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(pd.x, pd.y - 3, 4, 0, 6.29); ctx.fill(); }
-  // cars
-  for (const c of cars) drawCar(c);
-  // enemies
-  for (const e of enemies) {
-    ctx.fillStyle = e.color; ctx.beginPath(); ctx.arc(e.x, e.y, 13, 0, 6.29); ctx.fill();
-    ctx.fillStyle = '#c0392b'; ctx.fillRect(e.x - 14, e.y - 24, 28, 5); ctx.fillStyle = '#2ecc71'; ctx.fillRect(e.x - 14, e.y - 24, 28 * Math.max(0, e.hp / 50), 5);
-  }
-  // police
-  for (const po of police) {
-    if (po.kind === 'car') drawCar(po);
-    else { ctx.fillStyle = '#2233ff'; ctx.beginPath(); ctx.arc(po.x, po.y, 11, 0, 6.29); ctx.fill(); ctx.fillStyle = '#fff'; ctx.font = 'bold 10px sans-serif'; ctx.fillText('警', po.x, po.y + 4); }
-  }
-  if (heli) {
-    ctx.fillStyle = '#0006'; ctx.beginPath(); ctx.ellipse(heli.x, heli.y + 30, 60, 18, 0, 0, 6.29); ctx.fill();
-    ctx.fillStyle = '#ffd23d55'; ctx.beginPath(); ctx.moveTo(heli.x, heli.y); ctx.lineTo(P.x - 30, P.y); ctx.lineTo(P.x + 30, P.y); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = '#333'; ctx.beginPath(); ctx.arc(heli.x, heli.y, 14, 0, 6.29); ctx.fill();
-  }
-  // bullets
-  ctx.fillStyle = '#ffd23d';
-  for (const b of bullets) { ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, 6.29); ctx.fill(); }
-  // player
-  if (!P.car) {
-    ctx.fillStyle = '#ffd23d'; ctx.beginPath(); ctx.arc(P.x, P.y, 13, 0, 6.29); ctx.fill();
-    ctx.strokeStyle = '#222'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(P.x, P.y); ctx.lineTo(P.x + Math.cos(P.ang) * 22, P.y + Math.sin(P.ang) * 22); ctx.stroke();
-    ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(P.x + Math.cos(P.ang) * 6, P.y + Math.sin(P.ang) * 6, 5, 0, 6.29); ctx.fill();
-  }
-  // effects
-  ctx.textAlign = 'center'; ctx.font = 'bold 15px sans-serif';
-  for (const e of effects) { ctx.globalAlpha = Math.max(0, 1 - e.t); ctx.fillStyle = e.color || '#fff'; if (e.text) ctx.fillText(e.text, e.x, e.y - e.t * 30); ctx.globalAlpha = 1; }
+  for (const pc of G.cops) { if (pc.dead) continue; ctx.fillStyle = '#2244aa'; ctx.beginPath(); ctx.arc(pc.x, pc.y, 12, 0, 7); ctx.fill(); ctx.fillStyle = '#fff'; ctx.font = 'bold 9px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('警', pc.x, pc.y + 3); }
+  if (G.heli) { ctx.fillStyle = 'rgba(255,255,180,.25)'; ctx.beginPath(); ctx.arc(G.hero.x, G.hero.y, 90, 0, 7); ctx.fill(); ctx.fillStyle = '#333'; ctx.beginPath(); ctx.arc(G.heli.x, G.heli.y, 14, 0, 7); ctx.fill(); }
+  if (G.bagOut && !G.bagTaken) { ctx.fillStyle = '#00c853'; ctx.beginPath(); ctx.arc(G.bagAt.x, G.bagAt.y, 12, 0, 7); ctx.fill(); ctx.fillStyle = '#fff'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('$', G.bagAt.x, G.bagAt.y + 4); }
+  const h = G.hero;
+  if (!h.inCar) { ctx.fillStyle = '#ff5da2'; ctx.beginPath(); ctx.arc(h.x, h.y, 13, 0, 7); ctx.fill(); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(h.x, h.y); ctx.lineTo(h.x + Math.cos(h.angle) * 22, h.y + Math.sin(h.angle) * 22); ctx.stroke(); }
+  for (const b of G.shots) { if (b.mark) { ctx.fillStyle = 'rgba(0,0,0,.4)'; ctx.fillRect(b.x - 6, b.y - 2, 12, 4); } else { ctx.fillStyle = '#ffe14d'; ctx.fillRect(b.x - 3, b.y - 3, 6, 6); } }
   ctx.restore();
-  // vignette
-  $('vignette').style.boxShadow = G.vignette > 0 ? `inset 0 0 120px rgba(255,0,0,${G.vignette})` : 'inset 0 0 120px rgba(255,0,0,0)';
-  drawMinimap();
+  if (G.flash > 0 || h.hp < 30) { ctx.fillStyle = `rgba(255,0,0,${h.hp < 30 ? 0.14 + 0.08 * Math.sin(performance.now() / 200) : G.flash * 0.4})`; ctx.fillRect(0, 0, cv.width, cv.height); }
+  drawHud(); drawMinimap();
+  if (G.bannerT > 0) { ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 90, cv.width, 44); ctx.fillStyle = '#ffd166'; ctx.font = 'bold 26px sans-serif'; ctx.textAlign = 'center'; ctx.fillText(G.banner, cv.width / 2, 120); }
+  const car = nearestCar(h.x, h.y, 88);
+  if (G.mode === 'play' && !h.inCar && car && hyp(h.x, h.y, car.x, car.y) <= 52) { ctx.fillStyle = '#fff'; ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('按 E 上车', cv.width / 2, cv.height - 90); }
+  else if (G.mode === 'play' && !h.inCar && hyp(h.x, h.y, BAR.x + 60, BAR.y + 40) < 120) { ctx.fillStyle = '#fff'; ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('按 E 对话 / 接任务', cv.width / 2, cv.height - 90); }
+}
+function drawHud() {
+  const h = G.hero;
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(10, 10, 330, 118);
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'left';
+  const hh = Math.floor(G.clock / 60) % 24, mm = Math.floor(G.clock) % 60;
+  ctx.fillText(`❤ ${Math.ceil(h.hp)}  🛡 ${Math.ceil(h.armor)}  💰 $${G.money}  ★ ${'★'.repeat(G.wanted)}${'☆'.repeat(5 - G.wanted)}`, 20, 32);
+  ctx.fillText(`声望 ${G.rep}  金块 ${G.gold}  时间 ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`, 20, 56);
+  const w = GUNS[h.weapon];
+  ctx.fillText(`武器 ${w.name}  弹药 ${G.ammo[h.weapon] === Infinity ? '∞' : G.ammo[h.weapon]}  [1-4切换]`, 20, 80);
+  ctx.fillStyle = '#ffd166'; ctx.fillText('目标：' + G.objective, 20, 104);
+  ctx.fillStyle = '#9fd8ff'; ctx.font = '13px sans-serif'; ctx.fillText('📍 ' + districtAt(h.x, h.y) + '   第 ' + Math.min(G.chapter, 6) + ' 章 / 6', 20, 122);
+  if (h.inCar) { ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(cv.width - 190, cv.height - 70, 180, 56); ctx.fillStyle = '#fff'; ctx.font = 'bold 20px sans-serif'; ctx.textAlign = 'left'; ctx.fillText(Math.round(Math.abs(h.inCar.speed) * 0.9) + ' km/h', cv.width - 175, cv.height - 36); ctx.font = '13px sans-serif'; ctx.fillText('空格手刹 · E 下车', cv.width - 175, cv.height - 18); }
 }
 function drawMinimap() {
-  const sx = mm.width / WORLD_W, sy = mm.height / WORLD_H;
-  mmc.fillStyle = '#123'; mmc.fillRect(0, 0, mm.width, mm.height);
-  mmc.strokeStyle = '#888'; mmc.lineWidth = 2;
-  for (const s of city.segs) { const a = city.nodes[s.a], b = city.nodes[s.b]; mmc.beginPath(); mmc.moveTo(a.x * sx, a.y * sy); mmc.lineTo(b.x * sx, b.y * sy); mmc.stroke(); }
-  mmc.fillStyle = '#2a9fd8'; mmc.fillRect(0, SEA_Y * sy, mm.width, mm.height - SEA_Y * sy);
-  const dot = (x, y, c, r) => { mmc.fillStyle = c; mmc.beginPath(); mmc.arc(x * sx, y * sy, r || 3, 0, 6.29); mmc.fill(); };
-  dot(city.bar.x, city.bar.y, '#ff5b9a', 4); dot(city.gunShop.x, city.gunShop.y, '#e67e22'); dot(city.hospital.x, city.hospital.y, '#2ecc71'); dot(city.carShop.x, city.carShop.y, '#4db2ff'); dot(city.bank.x, city.bank.y, '#ffd23d');
-  if (G.target) dot(G.target.x, G.target.y, '#ff5b9a', 5);
-  for (const po of police) dot(po.x, po.y, '#2233ff', 3);
-  dot(P.x, P.y, '#fff', 4);
-  mmc.fillStyle = '#fff'; mmc.font = 'bold 11px sans-serif'; mmc.fillText('N ↑', 6, 12);
-  // view frame
-  mmc.strokeStyle = '#fff'; mmc.strokeRect(G.camX * sx, G.camY * sy, canvas.width * sx, canvas.height * sy);
+  const s = 150 / MAP_W, mx = cv.width - 170, my = 14;
+  ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(mx - 4, my - 4, 158, 118);
+  ctx.strokeStyle = '#888'; ctx.lineWidth = 1;
+  for (const [a, b] of ROADS) { const A = pt(a), B = pt(b); ctx.beginPath(); ctx.moveTo(mx + A.x * s, my + A.y * s); ctx.lineTo(mx + B.x * s, my + B.y * s); ctx.stroke(); }
+  const mk = missionSpot();
+  if (mk) { ctx.fillStyle = '#ff2e88'; ctx.fillRect(mx + mk.x * s - 3, my + mk.y * s - 3, 6, 6); }
+  ctx.fillStyle = '#00d0d0'; ctx.fillRect(mx + G.hero.x * s - 3, my + G.hero.y * s - 3, 6, 6);
+  for (const pc of G.cops) if (!pc.dead) { ctx.fillStyle = '#4488ff'; ctx.fillRect(mx + pc.x * s - 2, my + pc.y * s - 2, 4, 4); }
+  ctx.fillStyle = '#fff'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left'; ctx.fillText('N ↑', mx + 4, my + 112);
 }
-function updateHUD() {
-  $('hp').textContent = Math.ceil(G.hp); $('armour').textContent = Math.ceil(G.armour);
-  $('hpfill').style.width = Math.max(0, G.hp) + '%'; $('armfill').style.width = Math.min(100, G.armour) + '%';
-  $('money').textContent = G.money; $('rep').textContent = G.rep;
-  const h = Math.floor(G.time / 3600) % 24, m = Math.floor(G.time / 60) % 60;
-  $('clock').textContent = String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
-  $('weapon').textContent = WEAPONS[P.weapon].name;
-  $('ammo').textContent = P.weapon === 0 ? '' : '弹药 ' + P.ammo[P.weapon];
-  $('pkgs').textContent = G.pkgsGot + '/20'; $('comp').textContent = completion() + '%';
-  $('stars').textContent = '★'.repeat(G.wanted) + '☆'.repeat(5 - G.wanted);
-  $('district').textContent = city.district(P.x, P.y);
-  $('speedo').textContent = P.car ? Math.round(Math.abs(P.car.speed) * 1.2) + ' km/h' : '';
-  const car = nearCar();
-  let hint = '';
-  if (P.car) hint = 'W/S 加速/倒车 · A/D 转向 · 空格手刹 · E 下车 · H 喇叭';
-  else if (car && Math.hypot(car.x - P.x, car.y - P.y) <= 52) hint = car.isQuestTruck ? '按 E 上送货货车' : car.isStarter ? '按 E 上你的车' : '按 E 上车 / 偷车';
-  else if (Math.hypot(P.x - city.bar.x, P.y - city.bar.y) <= 56) hint = '按 E 和龙叔说话 / 接任务';
-  else if (Math.hypot(P.x - city.gunShop.x, P.y - city.gunShop.y) <= 56) hint = '按 E 进枪店';
-  else if (Math.hypot(P.x - city.hospital.x, P.y - city.hospital.y) <= 56) hint = '按 E 医院治疗 $50';
-  else if (Math.hypot(P.x - city.carShop.x, P.y - city.carShop.y) <= 56) hint = '按 E 车店喷漆清通缉';
-  else hint = 'WASD 移动 · 鼠标瞄准 · 左键开火 · E 互动';
-  const hEl = $('hint'); hEl.textContent = hint; hEl.style.display = G.screen === 'play' ? 'block' : 'none';
-}
-// ---- UI wiring ----
-$('btnNew').addEventListener('click', () => { resetGame(); });
-$('btnContinue').addEventListener('click', () => {
-  const s = saves.find(v => v);
-  if (s) loadSave(s); else { resetGame(); }
-});
-$('btnHow').addEventListener('click', () => { const b = $('howBox'); b.style.display = b.style.display === 'none' ? 'block' : 'none'; });
-$('btnResume').addEventListener('click', () => showScreen('play'));
-$('btnQuit').addEventListener('click', () => { showScreen('title'); });
-$('btnRetry').addEventListener('click', () => {
-  G.hp = 100; G.wanted = 0; police = []; heli = null; roadblocks = [];
-  G.missionActive = false; G.step = 0;
-  P.x = city.bar.x; P.y = city.bar.y; if (P.car) { P.car = null; }
-  setObjective('去龙叔酒吧按 E 重接本章', { x: city.bar.x, y: city.bar.y, label: '龙叔酒吧' });
-  showScreen('play');
-});
-$('btnEndMenu').addEventListener('click', () => showScreen('title'));
-function snapshot() {
-  return JSON.stringify({ chapter: G.chapter, money: G.money, rep: G.rep, hp: G.hp, pkgs: city.packages.map(p => p.got), owned: P.owned, ammo: P.ammo, x: P.x, y: P.y });
-}
-function loadSave(json) {
-  try {
-    const s = JSON.parse(json);
-    resetGame();
-    G.chapter = s.chapter; G.money = s.money; G.rep = s.rep; G.hp = s.hp;
-    P.owned = s.owned; P.ammo = s.ammo; P.x = s.x; P.y = s.y;
-    s.pkgs.forEach((g, i) => { if (g) { city.packages[i].got = true; G.pkgsGot++; } });
-    setObjective('去龙叔酒吧按 E 接任务', { x: city.bar.x, y: city.bar.y, label: '龙叔酒吧' });
-    showScreen('play');
-  } catch (e) { showDialog('存档读取失败。', 2500); }
-}
-[1, 2, 3].forEach(i => {
-  $('btnSave' + i).addEventListener('click', () => { saves[i - 1] = snapshot(); showDialog('已存到槽 ' + i + '（本页会话内有效）。', 2000); });
-});
-$('btnExport').addEventListener('click', () => {
-  const blob = new Blob([snapshot()], { type: 'application/json' });
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'vice-heat-save.json'; a.click();
-});
-$('btnImport').addEventListener('click', () => $('importFile').click());
-$('importFile').addEventListener('change', e => {
-  const f = e.target.files[0]; if (!f) return;
-  const r = new FileReader(); r.onload = () => loadSave(r.result); r.readAsText(f);
-});
-// ---- screenshot staging ----
-function stageShot(name) {
-  resetGame();
-  if (name === 'start') { G.screen = 'title'; showScreen('title'); }
-  else if (name === 'city') {
-    G.screen = 'play'; showScreen('play');
-    P.x = 1200; P.y = 700; G.camX = 0; G.camY = 0;
-    // zoomed-out feel: draw from a wide camera by shrinking the canvas view
-    G.camX = Math.max(0, 1200 - canvas.width / 2); G.camY = Math.max(0, 700 - canvas.height / 2);
-  } else if (name === 'action') {
-    G.screen = 'play'; showScreen('play');
-    P.x = city.nightMarket.x; P.y = city.nightMarket.y; P.owned[1] = true; P.ammo[1] = 60; P.weapon = 1;
-    spawnGang(); addWanted(2, 'shot'); G.missionText = '第三章：夜市火并鲨鱼帮'; G.target = { x: city.nightMarket.x, y: city.nightMarket.y, label: '夜市广场' };
-  } else { // play
-    G.screen = 'play'; showScreen('play');
-    const c = cars[0]; P.car = c; P.x = c.x; P.y = c.y; c.speed = 60;
-    G.missionText = '第一章：去东边枪店取手枪'; G.target = { x: city.gunShop.x, y: city.gunShop.y, label: '铁锤枪店' };
-  }
-  setObjective(G.missionText, G.target);
-  updateHUD();
-  let painted = 0;
-  const paint = () => {
-    if (shot === 'city') { G.camX = 0; G.camY = 0; }
-    stepUpdate(1 / 60); render(); painted++;
-    if (painted < 3) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  };
-  requestAnimationFrame(paint);
-}
-// ---- main loop ----
-let last = performance.now(), acc = 0;
+// ---------------- Loop, menus, shots & tests ----------------
 function frame(now) {
-  requestAnimationFrame(frame);
-  const dt = Math.min(0.25, (now - last) / 1000); last = now;
-  if (G.screen === 'play') { acc += dt; while (acc >= 1 / 60) { stepUpdate(1 / 60); acc -= 1 / 60; } }
-  if (G.screen === 'play' || G.screen === 'pause') render();
-}
-if (shot) {
-  resetGame();
-  stageShot(shot);
-} else {
-  showScreen('title');
-  // title backdrop: a slow pan over the city
-  G.camX = 400; G.camY = 400;
+  const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  try { update(dt); } catch (e) { console.error(e); } // one bad frame must never freeze the game
   render();
+  requestAnimationFrame(frame);
 }
+function resize() { cv.width = innerWidth; cv.height = innerHeight; }
+addEventListener('resize', resize); resize();
+function startGame(slot) {
+  if (slot !== undefined && SLOTS[slot]) { loadSlot(slot); return; }
+  G = newGame(); buildWorld(); G.mode = 'play'; hideMenus(); refreshObjective();
+  toast('新游戏开始：去酒吧见龙叔');
+}
+el('btnNew').onclick = () => startGame();
+el('btnContinue').onclick = () => { if (SLOTS[0]) loadSlot(0); else startGame(); };
+el('btnSlot2').onclick = () => startGame(1);
+el('btnSlot3').onclick = () => startGame(2);
+el('btnExport').onclick = exportSave;
+el('btnImport').onclick = () => el('fileImport').click();
+el('fileImport').onchange = e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader(); r.onload = () => { try { const d = JSON.parse(r.result); SLOTS[0] = JSON.stringify(d); loadSlot(0); } catch (err) { toast('导入失败'); } }; r.readAsText(f); };
+el('btnResume').onclick = () => { G.mode = 'play'; el('pauseMenu').classList.add('hidden'); };
+el('btnSave1').onclick = () => saveSlot(0);
+el('btnQuit').onclick = () => { G.mode = 'menu'; el('pauseMenu').classList.add('hidden'); el('menu').classList.remove('hidden'); };
+el('btnEndContinue').onclick = () => { G.mode = 'play'; el('endMenu').classList.add('hidden'); if (G.chapter > 6) { G.chapter = 7; refreshObjective(); } };
+el('btnEndMenu').onclick = () => { G.mode = 'menu'; el('endMenu').classList.add('hidden'); el('menu').classList.remove('hidden'); };
+function finishTest() { const t = el('test-result'); t.textContent = 'TEST: ' + (G.testResult || 'done'); document.title = 'TEST: ' + (G.testResult || 'done'); }
+window.__VH = {
+  get state() { return G; },
+  start: startGame,
+  teleport(x, y) { G.hero.x = x; G.hero.y = y; if (G.hero.inCar) { G.hero.inCar.x = x; G.hero.inCar.y = y; } },
+  setChapter(n) { G.chapter = n; G.stage = 0; G.gangLeft = 0; refreshObjective(); },
+  enterNearestCar() { const c = nearestCar(G.hero.x, G.hero.y, 200); if (c) boardCar(c); },
+  driveTo(gx, gy) {
+    const a = closestPoint(G.hero.x, G.hero.y), b = closestPoint(gx, gy);
+    const path = findRoute(a, b);
+    if (!path || path.length <= 1 || !G.hero.inCar) return false;
+    G.pilot = { path, idx: 1 }; G.testClock = 0; return true;
+  },
+  roadClearance() {
+    let worst = { d: 1e9, b: null };
+    for (const b of HOUSES) { const d = rectClearance(b.x, b.y, b.w, b.h); if (d < worst.d) worst = { d: Math.round(d), b: { x: Math.round(b.x), y: Math.round(b.y), w: Math.round(b.w), h: Math.round(b.h), label: b.label || '' } }; }
+    return worst;
+  },
+};
+// Screenshot modes (?shot=...) and headless playtests (?test=...)
+const params = new URLSearchParams(location.search);
+const shot = params.get('shot'), test = params.get('test');
+if (shot === 'play' || shot === 'action' || shot === 'city') {
+  startGame();
+  if (shot === 'play') { G.hero.x = 770; G.hero.y = 985; const c = nearestCar(770, 985, 120); if (c) boardCar(c); }
+  if (shot === 'action') {
+    G.chapter = 3; G.stage = 1; G.gangLeft = 7; G.foes = [];
+    for (let i = 0; i < 7; i++) G.foes.push({ x: MARKET.x + 60 + i * 30, y: MARKET.y + 80, hp: 60 });
+    G.hero.x = MARKET.x + 100; G.hero.y = MARKET.y + 180; G.hero.hp = 500; G.hero.armor = 100;
+    G.owned[1] = true; G.ammo[1] = 120; G.hero.weapon = 1; G.wanted = 2; refreshObjective();
+  }
+  if (shot === 'city') { G.hero.x = 1500; G.hero.y = 1000; G.camX = 1600; G.camY = 1100; }
+  hideMenus();
+} else if (shot === 'start') { G.mode = 'menu'; }
+else if (test) {
+  startGame(); hideMenus();
+  if (test === 'move') { G.hero.x = 800; G.hero.y = 1000; G.testResult = 'MOVE OK player at ' + G.hero.x + ',' + G.hero.y; setTimeout(finishTest, 600); }
+  if (test === 'drive') {
+    G.testMode = 'drive';
+    G.hero.x = 770; G.hero.y = 985; const c = nearestCar(770, 985, 120);
+    if (c) { boardCar(c); const ok = window.__VH.driveTo(GUN.x + 60, GUN.y + 140); if (!ok) G.testResult = 'DRIVE FAIL no path/car'; }
+    else G.testResult = 'DRIVE FAIL no car';
+  }
+  if (test === 'ch4') {
+    G.testMode = 'ch4'; G.chapter = 4; G.stage = 0; refreshObjective();
+    const q = G.cars.find(c => c.quest); G.hero.x = q.x; G.hero.y = q.y; boardCar(q);
+    let idx = 0;
+    const go = () => {
+      if (idx >= 4) { G.testResult = 'CH4 ' + (G.chapter === 5 ? 'OK completed' : 'FAIL chapter=' + G.chapter + ' idx=' + G.shipIdx); finishTest(); return; }
+      const p = DELIVERY_POINTS[idx];
+      const path = findRoute(closestPoint(q.x, q.y), closestPoint(p[0], p[1]));
+      if (!path || path.length <= 1) { G.testClock = 0; return; }
+      G.pilot = { path, idx: 1 }; G.testClock = 0;
+    };
+    const poll = setInterval(() => { if (!G.pilot) { clearInterval(poll); go(); } }, 400);
+    const poll2 = setInterval(() => {
+      if (G.shipIdx > idx) { idx = G.shipIdx; if (idx >= 4) { clearInterval(poll2); G.testResult = 'CH4 OK completed chapter=' + G.chapter; finishTest(); } else go(); }
+      if (G.testClock > 140) { clearInterval(poll2); G.testResult = 'CH4 FAIL timeout idx=' + G.shipIdx + ' chapter=' + G.chapter; finishTest(); }
+    }, 500);
+    go();
+  }
+  if (test === 'ch5') {
+    G.chapter = 5; refreshObjective(); G.owned[2] = true; G.ammo[2] = 500; G.hero.weapon = 2;
+    G.hero.x = G.truck.x + 80; G.hero.y = G.truck.y;
+    let shots = 0;
+    const iv = setInterval(() => {
+      if (G.bagOut) {
+        clearInterval(iv);
+        G.hero.x = G.bagAt.x; G.hero.y = G.bagAt.y;
+        setTimeout(() => {
+          G.wanted = 0; G.cops = [];
+          setTimeout(() => { G.testResult = 'CH5 ' + (G.chapter === 6 ? 'OK completed money=$' + G.money : 'FAIL chapter=' + G.chapter + ' bagTaken=' + G.bagTaken); finishTest(); }, 800);
+        }, 800);
+        return;
+      }
+      G.truckHp -= 25; G.stats.landed++; if (G.truckHp <= 0) dropBag();
+      shots++; if (shots > 40) { clearInterval(iv); G.testResult = 'CH5 FAIL hp=' + G.truckHp; finishTest(); }
+    }, 200);
+  }
+  if (test === 'ch6') {
+    G.testMode = 'ch6'; G.chapter = 6; G.vault = 0; refreshObjective();
+    G.hero.x = BANK.x + 65; G.hero.y = BANK.y + 45; G.hero.hp = 1000;
+    const iv = setInterval(() => {
+      G.cops.forEach(pc => { pc.dead = true; pc.hp = 0; }); G.bustedTimer = 0;
+      if (G.vault >= 45) {
+        clearInterval(iv);
+        G.wanted = 0; G.cops = []; G.hero.x = DOCK.x; G.hero.y = DOCK.y;
+        setTimeout(() => { G.testResult = 'CH6 ' + (G.chapter === 7 ? 'OK completed' : 'FAIL chapter=' + G.chapter + ' vault=' + Math.round(G.vault)); finishTest(); }, 600);
+        return;
+      }
+    }, 400);
+  }
+}
+// NOTE: no buildWorld() call here — startGame() spawns the world, and a second
+// spawn here would wipe shot/test setups (foes, quest truck, chapter state).
 requestAnimationFrame(frame);
-window.__viceHeat = { G, P, city, resetGame };
